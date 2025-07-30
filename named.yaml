@@ -1,0 +1,15 @@
+# 基本配置
+listen_addrs_ipv4: ["0.0.0.0"]
+listen_port: 8053
+
+# 全局转发配置 - 将所有查询转发到上游
+zones:
+  - zone: "."
+    zone_type: "External"
+    stores:
+      - type: "forward"
+        name_servers:
+          - socket_addr: "8.8.8.8:53"
+            protocol: "udp"
+            trust_negative_responses: false
+
