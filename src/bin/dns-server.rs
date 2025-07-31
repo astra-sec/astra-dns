@@ -48,8 +48,6 @@ use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
 };
-#[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-use tracing::warn;
 use tracing::{Event, Level, Subscriber, error, info};
 use tracing_subscriber::{
     EnvFilter,
@@ -64,8 +62,6 @@ use dns_server::Config;
 use dns_server::ExternalStoreConfig;
 #[cfg(feature = "prometheus-metrics")]
 use dns_server::PrometheusServer;
-#[cfg(feature = "__tls")]
-use dns_server::TlsCertConfig;
 #[cfg(feature = "metrics")]
 use dns_server::{ServerStoreConfig, ServerZoneConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{authority::Catalog, server::ServerFuture};
@@ -110,24 +106,6 @@ struct Cli {
     #[clap(short = 'p', long = "port", value_name = "PORT")]
     port: Option<u16>,
 
-    /// Listening port for DNS over TLS queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__tls")]
-    #[clap(long = "tls-port", value_name = "TLS-PORT")]
-    tls_port: Option<u16>,
-
-    /// Listening port for DNS over HTTPS queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__https")]
-    #[clap(long = "https-port", value_name = "HTTPS-PORT")]
-    https_port: Option<u16>,
-
-    /// Listening port for DNS over QUIC queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__quic")]
-    #[clap(long = "quic-port", value_name = "QUIC-PORT")]
-    quic_port: Option<u16>,
-
     /// Listening socket for Prometheus metrics,
     /// for remote access configure socket as needed (e.g. 0.0.0.0:9000)
     /// overrides any value in config file
@@ -147,24 +125,6 @@ struct Cli {
     /// overrides any value in config file
     #[clap(long = "disable-udp")]
     disable_udp: bool,
-
-    /// Disable TLS protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__tls")]
-    #[clap(long = "disable-tls", conflicts_with = "tls_port")]
-    disable_tls: bool,
-
-    /// Disable HTTPS protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__https")]
-    #[clap(long = "disable-https", conflicts_with = "https_port")]
-    disable_https: bool,
-
-    /// Disable QUIC protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__quic")]
-    #[clap(long = "disable-quic", conflicts_with = "quic_port")]
-    disable_quic: bool,
 
     /// Disable Prometheus metrics,
     /// overrides any value in config file
@@ -328,7 +288,6 @@ async fn async_run(args: Cli) -> Result<(), String> {
     let tcp_request_timeout = config.tcp_request_timeout();
 
     // now, run the server, based on the config
-    #[cfg_attr(not(feature = "__tls"), allow(unused_mut))]
     let mut server = ServerFuture::with_access(catalog, deny_networks, allow_networks);
 
     if !args.disable_udp && !config.disable_udp() {
@@ -371,57 +330,6 @@ async fn async_run(args: Cli) -> Result<(), String> {
         }
     } else {
         info!("TCP protocol is disabled");
-    }
-
-    #[cfg(feature = "__tls")]
-    if let Some(tls_cert_config) = config.tls_cert() {
-        #[cfg(feature = "__tls")]
-        if !args.disable_tls && !config.disable_tls() {
-            // setup TLS listeners
-            config_tls(
-                args.tls_port,
-                &mut server,
-                &config,
-                tls_cert_config,
-                &zone_dir,
-                &listen_addrs,
-            )?;
-        } else {
-            info!("TLS protocol is disabled");
-        }
-
-        #[cfg(feature = "__https")]
-        if !args.disable_https && !config.disable_https() {
-            // setup HTTPS listeners
-            config_https(
-                args.https_port,
-                &mut server,
-                &config,
-                tls_cert_config,
-                &zone_dir,
-                &listen_addrs,
-            )?;
-        } else {
-            info!("HTTPS protocol is disabled");
-        }
-
-        #[cfg(feature = "__quic")]
-        if !args.disable_quic && !config.disable_quic() {
-            // setup QUIC listeners
-            config_quic(
-                args.quic_port,
-                &mut server,
-                &config,
-                tls_cert_config,
-                &zone_dir,
-                &listen_addrs,
-            )?;
-        } else {
-            info!("QUIC protocol is disabled");
-        }
-    } else {
-        info!("TLS certificates are not provided");
-        info!("TLS related protocols (TLS, HTTPS and QUIC) are disabled")
     }
 
     // Drop privileges on Unix systems if running as root.
@@ -480,165 +388,12 @@ async fn async_run(args: Cli) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "__tls")]
-fn config_tls(
-    tls_port: Option<u16>,
-    server: &mut ServerFuture<Catalog>,
-    config: &Config,
-    tls_cert_config: &TlsCertConfig,
-    zone_dir: &Path,
-    listen_addrs: &[IpAddr],
-) -> Result<(), String> {
-    let tls_listen_port = tls_port.unwrap_or_else(|| config.tls_listen_port());
-
-    if listen_addrs.is_empty() {
-        warn!("a tls certificate was specified, but no TLS addresses configured to listen on");
-        return Ok(());
-    }
-
-    for addr in listen_addrs {
-        let tls_cert_path = &tls_cert_config.path;
-        info!("loading cert for DNS over TLS: {tls_cert_path:?}");
-
-        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
-            format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
-        })?;
-
-        info!("binding TLS to {addr:?}");
-
-        let tls_listener = build_tcp_listener(*addr, tls_listen_port)
-            .map_err(|err| format!("failed to bind to TLS socket address {addr:?}: {err}"))?;
-
-        info!(
-            "listening for TLS on {:?}",
-            tls_listener
-                .local_addr()
-                .map_err(|err| format!("failed to lookup local address: {err}"))?
-        );
-
-        server
-            .register_tls_listener(tls_listener, config.tcp_request_timeout(), tls_cert)
-            .map_err(|err| format!("failed to register TLS listener: {err}"))?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "__https")]
-fn config_https(
-    https_port: Option<u16>,
-    server: &mut ServerFuture<Catalog>,
-    config: &Config,
-    tls_cert_config: &TlsCertConfig,
-    zone_dir: &Path,
-    listen_addrs: &[IpAddr],
-) -> Result<(), String> {
-    let https_listen_port = https_port.unwrap_or_else(|| config.https_listen_port());
-    let endpoint_path = config.http_endpoint();
-
-    if listen_addrs.is_empty() {
-        warn!("a tls certificate was specified, but no HTTPS addresses configured to listen on");
-        return Ok(());
-    }
-
-    for addr in listen_addrs {
-        let tls_cert_path = &tls_cert_config.path;
-        if let Some(endpoint_name) = &tls_cert_config.endpoint_name {
-            info!("loading cert for DNS over TLS named {endpoint_name} from {tls_cert_path:?}");
-        } else {
-            info!("loading cert for DNS over TLS from {tls_cert_path:?}");
-        }
-        // TODO: see about modifying native_tls to impl Clone for Pkcs12
-        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
-            format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
-        })?;
-
-        info!("binding HTTPS to {addr:?}");
-
-        let https_listener = build_tcp_listener(*addr, https_listen_port)
-            .map_err(|err| format!("failed to bind to HTTPS socket address {addr:?}: {err}"))?;
-
-        info!(
-            "listening for HTTPS on {:?}",
-            https_listener
-                .local_addr()
-                .map_err(|err| format!("failed to lookup local address: {err}"))?
-        );
-
-        server
-            .register_https_listener(
-                https_listener,
-                config.tcp_request_timeout(),
-                tls_cert,
-                tls_cert_config.endpoint_name.clone(),
-                endpoint_path.into(),
-            )
-            .map_err(|err| format!("failed to register HTTPS listener: {err}"))?;
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "__quic")]
-fn config_quic(
-    quic_port: Option<u16>,
-    server: &mut ServerFuture<Catalog>,
-    config: &Config,
-    tls_cert_config: &TlsCertConfig,
-    zone_dir: &Path,
-    listen_addrs: &[IpAddr],
-) -> Result<(), String> {
-    let quic_listen_port = quic_port.unwrap_or_else(|| config.quic_listen_port());
-
-    if listen_addrs.is_empty() {
-        warn!("a tls certificate was specified, but no QUIC addresses configured to listen on");
-        return Ok(());
-    }
-
-    for addr in listen_addrs {
-        let tls_cert_path = &tls_cert_config.path;
-        if let Some(endpoint_name) = &tls_cert_config.endpoint_name {
-            info!("loading cert for DNS over QUIC named {endpoint_name} from {tls_cert_path:?}");
-        } else {
-            info!("loading cert for DNS over QUIC from {tls_cert_path:?}",);
-        }
-        // TODO: see about modifying native_tls to impl Clone for Pkcs12
-        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
-            format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
-        })?;
-
-        info!("Binding QUIC to {addr:?}");
-
-        let quic_listener = build_udp_socket(*addr, quic_listen_port)
-            .map_err(|err| format!("failed to bind to QUIC socket address {addr:?}: {err}"))?;
-
-        info!(
-            "listening for QUIC on {:?}",
-            quic_listener
-                .local_addr()
-                .map_err(|err| format!("failed to lookup local address: {err}"))?
-        );
-
-        server
-            .register_quic_listener(
-                quic_listener,
-                config.tcp_request_timeout(),
-                tls_cert,
-                tls_cert_config.endpoint_name.clone(),
-            )
-            .map_err(|err| format!("failed to register QUIC listener: {err}"))?;
-    }
-    Ok(())
-}
-
 fn banner() {
-    #[cfg(feature = "ascii-art")]
-    const crate_LOGO: &str = include_str!("hickory-dns.ascii");
-
     #[cfg(not(feature = "ascii-art"))]
-    const crate_LOGO: &str = "Hickory DNS";
+    const CRATE_LOGO: &str = "Hickory DNS";
 
     info!("");
-    for line in crate_LOGO.lines() {
+    for line in CRATE_LOGO.lines() {
         info!(" {line}");
     }
     info!("");

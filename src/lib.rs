@@ -7,13 +7,8 @@
 
 //! Configuration module for the server binary, `named`.
 
-#[cfg(feature = "__dnssec")]
-pub mod dnssec;
-
 #[cfg(feature = "prometheus-metrics")]
 use std::net::SocketAddr;
-#[cfg(feature = "__tls")]
-use std::{ffi::OsStr, fs};
 use std::{
     fmt,
     fs::File,
@@ -25,24 +20,11 @@ use std::{
     time::Duration,
 };
 
-use cfg_if::cfg_if;
 use ipnet::IpNet;
-#[cfg(feature = "__tls")]
-use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-    server::ResolvesServerCert,
-    sign::{CertifiedKey, SingleCertAndKey},
-};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
-#[cfg(feature = "__tls")]
-use hickory_proto::rustls::default_provider;
 use hickory_proto::{ProtoError, rr::Name};
-#[cfg(feature = "__dnssec")]
-use hickory_server::authority::DnssecAuthority;
-#[cfg(feature = "__dnssec")]
-use hickory_server::dnssec::NxProofKind;
 #[cfg(feature = "blocklist")]
 use hickory_server::store::blocklist::BlocklistAuthority;
 #[cfg(feature = "blocklist")]
@@ -72,10 +54,6 @@ pub use prometheus_server::PrometheusServer;
 
 static DEFAULT_PATH: &str = "/var/named"; // TODO what about windows (do I care? ;)
 static DEFAULT_PORT: u16 = 53;
-static DEFAULT_TLS_PORT: u16 = 853;
-static DEFAULT_HTTPS_PORT: u16 = 443;
-static DEFAULT_QUIC_PORT: u16 = 853; // https://www.rfc-editor.org/rfc/rfc9250.html#name-reservation-of-a-dedicated-
-static DEFAULT_H3_PORT: u16 = 443;
 static DEFAULT_TCP_REQUEST_TIMEOUT: u64 = 5;
 
 /// Server configuration
@@ -90,14 +68,6 @@ pub struct Config {
     listen_addrs_ipv6: Vec<String>,
     /// Port on which to listen (associated to all IPs)
     listen_port: Option<u16>,
-    /// Secure port to listen on
-    tls_listen_port: Option<u16>,
-    /// HTTPS port to listen on
-    https_listen_port: Option<u16>,
-    /// QUIC port to listen on
-    quic_listen_port: Option<u16>,
-    /// HTTP/3 port to listen on
-    h3_listen_port: Option<u16>,
     /// Prometheus listen address
     #[cfg(feature = "prometheus-metrics")]
     prometheus_listen_addr: Option<SocketAddr>,
@@ -134,13 +104,6 @@ pub struct Config {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_with_file")]
     zones: Vec<ZoneConfig>,
-    /// Certificate to associate to TLS connections (currently the same is used for HTTPS and TLS)
-    #[cfg(feature = "__tls")]
-    tls_cert: Option<TlsCertConfig>,
-    /// The HTTP endpoint where the DNS-over-HTTPS server provides service. Applicable
-    /// to both HTTP/2 and HTTP/3 servers. Typically `/dns-query`.
-    #[cfg(any(feature = "__https", feature = "__h3"))]
-    http_endpoint: Option<String>,
     /// Networks denied to access the server
     #[serde(default)]
     deny_networks: Vec<IpNet>,
@@ -176,26 +139,6 @@ impl Config {
     /// port on which to listen for connections on specified addresses
     pub fn listen_port(&self) -> u16 {
         self.listen_port.unwrap_or(DEFAULT_PORT)
-    }
-
-    /// port on which to listen for TLS connections
-    pub fn tls_listen_port(&self) -> u16 {
-        self.tls_listen_port.unwrap_or(DEFAULT_TLS_PORT)
-    }
-
-    /// port on which to listen for HTTPS connections
-    pub fn https_listen_port(&self) -> u16 {
-        self.https_listen_port.unwrap_or(DEFAULT_HTTPS_PORT)
-    }
-
-    /// port on which to listen for QUIC connections
-    pub fn quic_listen_port(&self) -> u16 {
-        self.quic_listen_port.unwrap_or(DEFAULT_QUIC_PORT)
-    }
-
-    /// port on which to listen for HTTP/3 connections
-    pub fn h3_listen_port(&self) -> u16 {
-        self.h3_listen_port.unwrap_or(DEFAULT_H3_PORT)
     }
 
     /// prometheus metric endpoint listen address
@@ -263,25 +206,6 @@ impl Config {
     /// the set of zones which should be loaded
     pub fn zones(&self) -> &[ZoneConfig] {
         &self.zones
-    }
-
-    /// the tls certificate to use for accepting tls connections
-    pub fn tls_cert(&self) -> Option<&TlsCertConfig> {
-        cfg_if! {
-            if #[cfg(feature = "__tls")] {
-                self.tls_cert.as_ref()
-            } else {
-                None
-            }
-        }
-    }
-
-    /// the HTTP endpoint from where requests are received
-    #[cfg(any(feature = "__https", feature = "__h3"))]
-    pub fn http_endpoint(&self) -> &str {
-        self.http_endpoint
-            .as_deref()
-            .unwrap_or(hickory_proto::http::DEFAULT_DNS_QUERY_PATH)
     }
 
     /// get the networks denied access to this server
@@ -399,41 +323,31 @@ impl ZoneConfig {
                     let authority: Arc<dyn AuthorityObject> = match store {
                         #[cfg(feature = "sqlite")]
                         ServerStoreConfig::Sqlite(config) => {
-                            #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
-                            let mut authority = SqliteAuthority::try_from_config(
+                            let authority = SqliteAuthority::try_from_config(
                                 zone_name.clone(),
                                 zone_type,
                                 is_axfr_allowed,
                                 server_config.is_dnssec_enabled(),
                                 Some(zone_dir),
                                 config,
-                                #[cfg(feature = "__dnssec")]
-                                server_config.nx_proof_kind.clone(),
                             )
                             .await?;
 
-                            #[cfg(feature = "__dnssec")]
-                            server_config.load_keys(&mut authority, &zone_name).await?;
                             Arc::new(authority)
                         }
 
                         ServerStoreConfig::File(config) => {
-                            #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
-                            let mut authority = FileAuthority::try_from_config(
+                            let authority = FileAuthority::try_from_config(
                                 zone_name.clone(),
                                 zone_type,
                                 is_axfr_allowed,
                                 Some(zone_dir),
                                 config,
-                                #[cfg(feature = "__dnssec")]
-                                server_config.nx_proof_kind.clone(),
                             )?;
 
-                            #[cfg(feature = "__dnssec")]
-                            server_config.load_keys(&mut authority, &zone_name).await?;
                             Arc::new(authority)
                         }
-                        _ => return panic!(),
+                        _ => return Err("Unsupported store configuration".to_string()),
                     };
 
                     authorities.push(authority);
@@ -540,13 +454,6 @@ impl ZoneTypeConfig {
 pub struct ServerZoneConfig {
     /// Allow AXFR (TODO: need auth)
     pub allow_axfr: Option<bool>,
-    /// Keys for use by the zone
-    #[cfg(feature = "__dnssec")]
-    #[serde(default)]
-    pub keys: Vec<dnssec::KeyConfig>,
-    /// The kind of non-existence proof provided by the nameserver
-    #[cfg(feature = "__dnssec")]
-    pub nx_proof_kind: Option<NxProofKind>,
     /// Store configurations.  Note: we specify a default handler to get a Vec containing a
     /// StoreConfig::Default, which is used for authoritative file-based zones and legacy sqlite
     /// configurations. #[serde(default)] cannot be used, because it will invoke Default for Vec,
@@ -558,29 +465,6 @@ pub struct ServerZoneConfig {
 }
 
 impl ServerZoneConfig {
-    #[cfg(feature = "__dnssec")]
-    async fn load_keys(
-        &self,
-        authority: &mut impl DnssecAuthority<Lookup = impl Send + Sync + Sized + 'static>,
-        zone_name: &Name,
-    ) -> Result<(), String> {
-        if !self.is_dnssec_enabled() {
-            return Ok(());
-        }
-
-        for key_config in &self.keys {
-            key_config.load(authority, zone_name.clone()).await?;
-        }
-
-        info!("signing zone: {zone_name}");
-        authority
-            .secure_zone()
-            .await
-            .map_err(|err| format!("failed to sign zone {zone_name}: {err}"))?;
-
-        Ok(())
-    }
-
     /// path to the zone file, i.e. the base set of original records in the zone
     ///
     /// this is only used on first load, if dynamic update is enabled for the zone, then the journal
@@ -601,13 +485,7 @@ impl ServerZoneConfig {
 
     /// declare that this zone should be signed, see keys for configuration of the keys for signing
     pub fn is_dnssec_enabled(&self) -> bool {
-        cfg_if! {
-            if #[cfg(feature = "__dnssec")] {
-                !self.keys.is_empty()
-            } else {
-                false
-            }
-        }
+        false
     }
 }
 
@@ -689,159 +567,4 @@ where
     }
 
     deserializer.deserialize_any(MapOrSequence::<T>(Default::default()))
-}
-
-/// Configuration for a TLS certificate
-#[derive(Deserialize, PartialEq, Eq, Debug)]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct TlsCertConfig {
-    pub path: PathBuf,
-    pub endpoint_name: Option<String>,
-    pub private_key: PathBuf,
-}
-
-#[cfg(feature = "__tls")]
-impl TlsCertConfig {
-    /// Load a Certificate from the path (with rustls)
-    pub fn load(&self, zone_dir: &Path) -> Result<Arc<dyn ResolvesServerCert>, String> {
-        if self.path.extension().and_then(OsStr::to_str) != Some("pem") {
-            return Err(format!(
-                "unsupported certificate file format (expected `.pem` extension): {}",
-                self.path.display()
-            ));
-        }
-
-        let cert_path = zone_dir.join(&self.path);
-        info!(
-            "loading TLS PEM certificate chain from: {}",
-            cert_path.display()
-        );
-
-        let cert_chain = CertificateDer::pem_file_iter(&cert_path)
-            .map_err(|e| {
-                format!(
-                    "failed to read cert chain from {}: {e}",
-                    cert_path.display()
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                format!(
-                    "failed to parse cert chain from {}: {e}",
-                    cert_path.display()
-                )
-            })?;
-
-        let key_extension = self.private_key.extension();
-        let key = if key_extension.is_some_and(|ext| ext == "pem") {
-            let key_path = zone_dir.join(&self.private_key);
-            info!("loading TLS PKCS8 key from PEM: {}", key_path.display());
-            PrivateKeyDer::from_pem_file(&key_path)
-                .map_err(|e| format!("failed to read key from {}: {e}", key_path.display()))?
-        } else if key_extension.is_some_and(|ext| ext == "der" || ext == "key") {
-            let key_path = zone_dir.join(&self.private_key);
-            info!("loading TLS PKCS8 key from DER: {}", key_path.display());
-
-            let buf =
-                fs::read(&key_path).map_err(|e| format!("error reading key from file: {e}"))?;
-            PrivateKeyDer::try_from(buf).map_err(|e| format!("error parsing key DER: {e}"))?
-        } else {
-            return Err(format!(
-                "unsupported private key file format (expected `.pem` or `.der` extension): {}",
-                self.private_key.display()
-            ));
-        };
-
-        let certified_key = CertifiedKey::from_der(cert_chain, key, &default_provider())
-            .map_err(|err| format!("failed to read certificate and keys: {err:?}"))?;
-
-        Ok(Arc::new(SingleCertAndKey::from(certified_key)))
-    }
-}
-
-#[cfg(all(test, any(feature = "resolver", feature = "recursor")))]
-mod tests {
-    use super::*;
-
-    #[cfg(feature = "recursor")]
-    #[test]
-    fn example_recursor_config() {
-        toml::from_str::<Config>(include_str!(
-            "../../tests/test-data/test_configs/example_recursor.toml"
-        ))
-        .unwrap();
-    }
-
-    #[cfg(feature = "resolver")]
-    #[test]
-    fn single_store_config_error_message() {
-        match toml::from_str::<Config>(
-            r#"[[zones]]
-               zone = "."
-               zone_type = "External"
-
-               [zones.stores]
-               ype = "forward""#,
-        ) {
-            Ok(val) => panic!("expected error value; got ok: {val:?}"),
-            Err(e) => assert!(e.to_string().contains("missing field `type`")),
-        }
-    }
-
-    #[cfg(feature = "resolver")]
-    #[test]
-    fn chained_store_config_error_message() {
-        match toml::from_str::<Config>(
-            r#"[[zones]]
-               zone = "."
-               zone_type = "External"
-
-               [[zones.stores]]
-               type = "forward"
-
-               [[zones.stores.name_servers]]
-               socket_addr = "8.8.8.8:53"
-               protocol = "udp"
-               trust_negative_responses = false
-
-               [[zones.stores]]
-               type = "forward"
-
-               [[zones.stores.name_servers]]
-               socket_addr = "1.1.1.1:53"
-               rotocol = "udp"
-               trust_negative_responses = false"#,
-        ) {
-            Ok(val) => panic!("expected error value; got ok: {val:?}"),
-            Err(e) => assert!(dbg!(e).to_string().contains("unknown field `rotocol`")),
-        }
-    }
-
-    #[cfg(feature = "resolver")]
-    #[test]
-    fn file_store_zone_file_path() {
-        match toml::from_str::<Config>(
-            r#"[[zones]]
-               zone = "localhost"
-               zone_type = "Primary"
-
-               [zones.stores]
-               type = "file"
-               zone_file_path = "default/localhost.zone""#,
-        ) {
-            Ok(val) => {
-                let ZoneTypeConfig::Primary(config) = &val.zones[0].zone_type_config else {
-                    panic!("expected primary zone type");
-                };
-
-                assert_eq!(config.stores.len(), 1);
-                assert!(matches!(
-                        &config.stores[0],
-                    ServerStoreConfig::File(FileConfig { zone_file_path }) if zone_file_path == Path::new("default/localhost.zone"),
-                ));
-            }
-            Err(e) => panic!("expected successful parse: {e:?}"),
-        }
-    }
 }
