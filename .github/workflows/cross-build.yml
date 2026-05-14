@@ -53,10 +53,6 @@ jobs:
             target: armv7-unknown-linux-musleabihf
             command: cross
             bin: astra-dns
-          - os: macos-14
-            target: aarch64-apple-darwin
-            command: cargo
-            bin: astra-dns
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             command: cargo
