@@ -50,6 +50,7 @@ use tracing_subscriber::{
     EnvFilter,
     fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format},
     layer::SubscriberExt,
+    reload,
     registry::LookupSpan,
     util::SubscriberInitExt,
 };
@@ -118,20 +119,17 @@ fn main() -> Result<(), String> {
 fn run() -> Result<(), String> {
     let args = Cli::parse();
 
+    let initial_filter = EnvFilter::builder()
+        .with_default_directive(Level::WARN.into())
+        .from_env()
+        .map_err(|err| format!("failed to parse environment variable for tracing: {err}"))?;
+    let (filter_layer, filter_handle) = reload::Layer::new(initial_filter);
+
     // Setup tracing for logging based on input
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().event_format(TdnsFormatter))
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .from_env()
-                .map_err(|err| {
-                    format!("failed to parse environment variable for tracing: {err}")
-                })?,
-        )
+        .with(filter_layer)
         .init();
-
-    info!("Hickory DNS {} starting...", hickory_client::version());
 
     let mut runtime = runtime::Builder::new_multi_thread();
     runtime.enable_all().thread_name("hickory-server-runtime");
@@ -142,19 +140,26 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|err| format!("failed to initialize Tokio runtime: {err}"))?;
 
-    runtime.block_on(async_run(args))
+    runtime.block_on(async_run(args, filter_handle))
 }
 
-async fn async_run(args: Cli) -> Result<(), String> {
+async fn async_run<S>(
+    args: Cli,
+    log_filter_handle: reload::Handle<EnvFilter, S>,
+) -> Result<(), String>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
     // Load configuration files
 
     let config = args.config.clone();
     let config_path = std::path::Path::new(&config);
 
-    info!("loading configuration from: {config_path:?}");
-
     let loaded = load_runtime_config(config_path).await?;
     let config = loaded.config;
+    update_log_level(&log_filter_handle, config.log_level())?;
+    info!("Hickory DNS {} starting...", hickory_client::version());
+    info!("loading configuration from: {config_path:?}");
     let mut reload_settings = ReloadSettings::from_effective_config(&args, &config, config_path)?;
     #[cfg(feature = "prometheus-metrics")]
     let prometheus_server = if !args.disable_prometheus && !config.disable_prometheus() {
@@ -298,7 +303,13 @@ async fn async_run(args: Cli) -> Result<(), String> {
                     break;
                 }
                 _ = reload_signal.recv() => {
-                    match reload_runtime_config(config_path, &args, &handler, &mut reload_settings).await {
+                    match reload_runtime_config(
+                        config_path,
+                        &args,
+                        &handler,
+                        &mut reload_settings,
+                        &log_filter_handle,
+                    ).await {
                         Ok(()) => info!("configuration reload completed"),
                         Err(err) => error!("configuration reload failed: {err}"),
                     }
@@ -392,21 +403,42 @@ async fn build_catalog(config_path: &std::path::Path, config: &Config) -> Result
     Ok(catalog)
 }
 
-async fn reload_runtime_config(
+async fn reload_runtime_config<S>(
     config_path: &std::path::Path,
     args: &Cli,
     handler: &ReloadableCatalog,
     active_settings: &mut ReloadSettings,
-) -> Result<(), String> {
+    log_filter_handle: &reload::Handle<EnvFilter, S>,
+) -> Result<(), String>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
     info!("reloading configuration from {config_path:?}");
 
     let loaded = load_runtime_config(config_path).await?;
     let new_settings = ReloadSettings::from_effective_config(args, &loaded.config, config_path)?;
     active_settings.ensure_reload_safe(&new_settings)?;
+    update_log_level(log_filter_handle, loaded.config.log_level())?;
     handler.replace(loaded.catalog);
     *active_settings = new_settings;
 
     Ok(())
+}
+
+fn update_log_level<S>(
+    handle: &reload::Handle<EnvFilter, S>,
+    level: Level,
+) -> Result<(), String>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    let filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env()
+        .map_err(|err| format!("failed to parse environment variable for tracing: {err}"))?;
+    handle
+        .reload(filter)
+        .map_err(|err| format!("failed to reload tracing filter: {err}"))
 }
 
 struct LoadedRuntimeConfig {

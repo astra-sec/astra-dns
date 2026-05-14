@@ -84,10 +84,15 @@ The server supports these core DNS settings:
 
 - listen IPv4 / IPv6 addresses
 - listen port
+- `log_level`
 - TCP / UDP enable or disable
 - TCP timeout
 - `External` zones
 - `forward` stores
+
+`log_level` supports `Trace`, `Debug`, `Info`, `Warn`, and `Error`.
+The default is `Warn` so normal router deployments do not spam per-query `INFO`
+logs unless you explicitly opt in.
 
 For a simple router-style forwarding setup, the server also supports a compact
 AdGuard Home-inspired syntax:
@@ -241,6 +246,7 @@ dig @127.0.0.1 -p 8053 example.com A +tcp
 ```yaml
 listen_addrs_ipv4: ["127.0.0.1"]
 listen_port: 8053
+log_level: "Warn"
 
 filters:
   - enabled: true

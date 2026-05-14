@@ -70,7 +70,7 @@ pub struct Config {
     disable_prometheus: Option<bool>,
     /// Timeout associated to a request before it is closed.
     tcp_request_timeout: Option<u64>,
-    /// Level at which to log, default is INFO
+    /// Level at which to log, default is WARN
     log_level: Option<String>,
     /// User to run the server as.
     ///
@@ -180,9 +180,9 @@ impl Config {
     /// specify the log level which should be used, ["Trace", "Debug", "Info", "Warn", "Error"]
     pub fn log_level(&self) -> tracing::Level {
         if let Some(level_str) = &self.log_level {
-            tracing::Level::from_str(level_str).unwrap_or(tracing::Level::INFO)
+            tracing::Level::from_str(level_str).unwrap_or(tracing::Level::WARN)
         } else {
-            tracing::Level::INFO
+            tracing::Level::WARN
         }
     }
 
