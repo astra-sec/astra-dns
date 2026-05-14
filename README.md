@@ -86,9 +86,8 @@ The server supports these core DNS settings:
 - listen port
 - TCP / UDP enable or disable
 - TCP timeout
-- access control with `allow_networks` and `deny_networks`
 - `External` zones
-- `forward`, `blocklist`, and `recursor` stores
+- `forward` stores
 
 For a simple router-style forwarding setup, the server also supports a compact
 AdGuard Home-inspired syntax:

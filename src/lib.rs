@@ -12,31 +12,18 @@ use std::{
     fs::File,
     io::Read,
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
-use ipnet::IpNet;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
 use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
-#[cfg(feature = "resolver")]
 use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup};
-#[cfg(feature = "blocklist")]
-use hickory_server::store::blocklist::BlocklistAuthority;
-#[cfg(feature = "blocklist")]
-use hickory_server::store::blocklist::BlocklistConfig;
-#[cfg(feature = "resolver")]
 use hickory_server::store::forwarder::ForwardAuthority;
-#[cfg(feature = "resolver")]
 use hickory_server::store::forwarder::ForwardConfig;
-#[cfg(feature = "recursor")]
-use hickory_server::store::recursor::RecursiveAuthority;
-#[cfg(feature = "recursor")]
-use hickory_server::store::recursor::RecursiveConfig;
 use hickory_server::authority::{AuthorityObject, ZoneType};
 use tracing::{debug, info, warn};
 
@@ -48,7 +35,6 @@ pub use adblock::{AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterCo
 #[cfg(feature = "prometheus-metrics")]
 pub use prometheus_server::PrometheusServer;
 
-static DEFAULT_PATH: &str = "/var/named"; // TODO what about windows (do I care? ;)
 static DEFAULT_PORT: u16 = 53;
 static DEFAULT_TCP_REQUEST_TIMEOUT: u64 = 5;
 
@@ -84,8 +70,6 @@ pub struct Config {
     tcp_request_timeout: Option<u64>,
     /// Level at which to log, default is INFO
     log_level: Option<String>,
-    /// Base configuration directory, i.e. root path for zones
-    directory: Option<String>,
     /// User to run the server as.
     ///
     /// Only supported on Unix-like platforms. If the real or effective UID of the hickory process
@@ -111,17 +95,11 @@ pub struct Config {
     /// Blocking behavior inspired by AdGuard Home's `filtering`
     #[serde(default)]
     filtering: FilteringConfig,
-    /// Networks denied to access the server
-    #[serde(default)]
-    deny_networks: Vec<IpNet>,
-    /// Networks allowed to access the server
-    #[serde(default)]
-    allow_networks: Vec<IpNet>,
 }
 
 impl Config {
     /// read a Config file from the file specified at path.
-    pub fn read_config(path: &Path) -> Result<Self, serde_yaml::Error> {
+    pub fn read_config(path: &std::path::Path) -> Result<Self, serde_yaml::Error> {
         let mut file = File::open(path).unwrap();
         let mut yaml = String::new();
         file.read_to_string(&mut yaml).unwrap();
@@ -206,13 +184,6 @@ impl Config {
         }
     }
 
-    /// the path for all zone configurations, defaults to `/var/named`
-    pub fn directory(&self) -> &Path {
-        self.directory
-            .as_ref()
-            .map_or(Path::new(DEFAULT_PATH), Path::new)
-    }
-
     /// the set of zones which should be loaded
     pub fn zones(&self) -> &[ZoneConfig] {
         &self.zones
@@ -242,16 +213,6 @@ impl Config {
         })
     }
 
-    /// get the networks denied access to this server
-    pub fn deny_networks(&self) -> &[IpNet] {
-        &self.deny_networks
-    }
-
-    /// get the networks allowed to connect to this server
-    pub fn allow_networks(&self) -> &[IpNet] {
-        &self.allow_networks
-    }
-
     fn normalize(mut self) -> Result<Self, String> {
         if let Some(dns) = &self.dns {
             if !dns.upstream_dns.is_empty() {
@@ -265,11 +226,6 @@ impl Config {
                 #[cfg(feature = "resolver")]
                 {
                     self.zones = vec![ZoneConfig::root_forward(dns.upstream_dns.clone())?];
-                }
-
-                #[cfg(not(feature = "resolver"))]
-                {
-                    return Err("`dns.upstream_dns` requires the `resolver` feature".to_owned());
                 }
             }
         }
@@ -293,7 +249,6 @@ enum UpstreamDnsConfig {
 }
 
 impl UpstreamDnsConfig {
-    #[cfg(feature = "resolver")]
     fn into_name_server_config(self) -> Result<NameServerConfig, String> {
         match self {
             Self::Address(address) => parse_upstream_dns_address(&address),
@@ -302,7 +257,6 @@ impl UpstreamDnsConfig {
     }
 }
 
-#[cfg(feature = "resolver")]
 fn parse_upstream_dns_address(address: &str) -> Result<NameServerConfig, String> {
     let (protocol, address) = if let Some(addr) = address.strip_prefix("udp://") {
         (Protocol::Udp, addr)
@@ -342,7 +296,6 @@ pub struct ZoneConfig {
 }
 
 impl ZoneConfig {
-    #[cfg(feature = "resolver")]
     fn root_forward(upstreams: Vec<UpstreamDnsConfig>) -> Result<Self, String> {
         let name_servers: Vec<NameServerConfig> = upstreams
             .into_iter()
@@ -363,7 +316,6 @@ impl ZoneConfig {
     #[warn(clippy::wildcard_enum_match_arm)] // make sure all cases are handled despite of non_exhaustive
     pub async fn load(
         &self,
-        zone_dir: &Path,
         adblock_rules: Option<&CompiledRuleSets>,
     ) -> Result<Vec<Arc<dyn AuthorityObject>>, String> {
         debug!("loading zone with config: {self:#?}");
@@ -371,28 +323,10 @@ impl ZoneConfig {
         let zone_name = self
             .zone()
             .map_err(|err| format!("failed to read zone name: {err}"))?;
-        let zone_type = self.zone_type();
 
         // load the zone and insert any configured authorities in the catalog.
 
         let mut authorities: Vec<Arc<dyn AuthorityObject>> = vec![];
-
-        #[cfg(feature = "blocklist")]
-        let handle_blocklist_store = |config| {
-            let zone_name = zone_name.clone();
-
-            async move {
-                Result::<Arc<dyn AuthorityObject>, String>::Ok(Arc::new(
-                    BlocklistAuthority::try_from_config(
-                        zone_name.clone(),
-                        zone_type,
-                        config,
-                        Some(zone_dir),
-                    )
-                    .await?,
-                ))
-            }
-        };
 
         match &self.zone_type_config {
             ZoneTypeConfig::External { stores } => {
@@ -401,17 +335,8 @@ impl ZoneConfig {
                     stores
                 );
 
-                #[cfg_attr(
-                    not(any(feature = "blocklist", feature = "resolver")),
-                    allow(unreachable_code, unused_variables, clippy::never_loop)
-                )]
                 for store in stores {
                     let authority: Arc<dyn AuthorityObject> = match store {
-                        #[cfg(feature = "blocklist")]
-                        ExternalStoreConfig::Blocklist(config) => {
-                            handle_blocklist_store(config).await?
-                        }
-                        #[cfg(feature = "resolver")]
                         ExternalStoreConfig::Forward(config) => {
                             if let Some(adblock_rules) = adblock_rules {
                                 let chained = adblock::build_authorities(
@@ -428,18 +353,6 @@ impl ZoneConfig {
                                 .build()?;
 
                             Arc::new(forwarder)
-                        }
-                        #[cfg(feature = "recursor")]
-                        ExternalStoreConfig::Recursor(config) => {
-                            let recursor = RecursiveAuthority::try_from_config(
-                                zone_name.clone(),
-                                zone_type,
-                                config,
-                                Some(zone_dir),
-                            )
-                            .await?;
-
-                            Arc::new(recursor)
                         }
                         _ => return empty_stores_error(),
                     };
@@ -490,15 +403,8 @@ pub enum ZoneTypeConfig {
 #[serde(rename_all = "lowercase", tag = "type")]
 #[non_exhaustive]
 pub enum ExternalStoreConfig {
-    /// Blocklist configuration
-    #[cfg(feature = "blocklist")]
-    Blocklist(BlocklistConfig),
     /// Forwarding Resolver
-    #[cfg(feature = "resolver")]
     Forward(ForwardConfig),
-    /// Recursive Resolver
-    #[cfg(feature = "recursor")]
-    Recursor(Box<RecursiveConfig>),
     /// This is used by the configuration processing code to represent a deprecated or main-block config without an associated store.
     #[default]
     Default,

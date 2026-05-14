@@ -17,7 +17,6 @@
 //!    -h, --help              Show this message
 //!    -v, --version           Show the version of hickory-dns
 //!    -c FILE, --config=FILE  Path to configuration file, default is /etc/named.yaml
-//!    -z DIR, --zonedir=DIR   Path to the root directory for all zone files, see also config yaml
 //!    -p PORT, --port=PORT    Override the listening port
 //!    --tls-port=PORT         Override the listening port for TLS connections
 //! ```
@@ -30,7 +29,7 @@ use std::{
     fmt,
     io::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use clap::Parser;
@@ -58,8 +57,6 @@ use tracing_subscriber::{
 };
 
 use dns_server::{CompiledRuleSets, Config};
-#[cfg(all(feature = "metrics", feature = "resolver"))]
-use dns_server::ExternalStoreConfig;
 #[cfg(feature = "prometheus-metrics")]
 use dns_server::PrometheusServer;
 #[cfg(feature = "metrics")]
@@ -95,11 +92,6 @@ struct Cli {
         value_hint=clap::ValueHint::FilePath,
     )]
     config: PathBuf,
-
-    /// Path to the root directory for all zone files,
-    /// see also config yaml
-    #[clap(short = 'z', long = "zonedir", value_name = "DIR", value_hint=clap::ValueHint::DirPath)]
-    zonedir: Option<PathBuf>,
 
     /// Listening port for DNS queries,
     /// overrides any value in config file
@@ -186,7 +178,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
     // Load configuration files
 
     let config = args.config.clone();
-    let config_path = Path::new(&config);
+    let config_path = std::path::Path::new(&config);
 
     info!("loading configuration from: {config_path:?}");
 
@@ -196,13 +188,6 @@ async fn async_run(args: Cli) -> Result<(), String> {
         Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config).await?),
         None => None,
     };
-    let directory_config = config.directory().to_path_buf();
-    let zonedir = args.zonedir.clone();
-    let zone_dir: PathBuf = zonedir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or(directory_config);
-
     #[cfg(feature = "prometheus-metrics")]
     let prometheus_server_opt = if !args.disable_prometheus && !config.disable_prometheus() {
         let socket_addr = args
@@ -254,7 +239,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
             .zone()
             .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
 
-        match zone.load(&zone_dir, adblock_rules.as_ref()).await {
+        match zone.load(adblock_rules.as_ref()).await {
             Ok(authority) => catalog.upsert(zone_name.into(), authority),
             Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
         }
@@ -287,12 +272,10 @@ async fn async_run(args: Cli) -> Result<(), String> {
         return Ok(());
     }
 
-    let deny_networks = config.deny_networks();
-    let allow_networks = config.allow_networks();
     let tcp_request_timeout = config.tcp_request_timeout();
 
     // now, run the server, based on the config
-    let mut server = ServerFuture::with_access(catalog, deny_networks, allow_networks);
+    let mut server = ServerFuture::new(catalog);
 
     if !args.disable_udp && !config.disable_udp() {
         // load all udp listeners
@@ -462,10 +445,6 @@ where
 struct ConfigMetrics {
     #[cfg(feature = "resolver")]
     zones_forwarder: Counter,
-    #[cfg(feature = "blocklist")]
-    zones_blocklist: Counter,
-    #[cfg(feature = "recursor")]
-    zones_recursor: Counter,
 }
 
 #[cfg(feature = "metrics")]
@@ -476,14 +455,11 @@ impl ConfigMetrics {
         hickory_info.set(1);
 
         let hickory_config_info = gauge!("hickory_config_info",
-            "directory" => config.directory().to_string_lossy().to_string(),
             "disable_https" => config.disable_https().to_string(),
             "disable_quic" => config.disable_quic().to_string(),
             "disable_tcp" => config.disable_tcp().to_string(),
             "disable_tls" => config.disable_tls().to_string(),
             "disable_udp" => config.disable_udp().to_string(),
-            "allow_networks" => config.allow_networks().len().to_string(),
-            "deny_networks" => config.deny_networks().len().to_string(),
             "zones" => config.zones().len().to_string()
         );
         describe_gauge!(
@@ -503,18 +479,10 @@ impl ConfigMetrics {
 
         #[cfg(feature = "resolver")]
         let zones_forwarder = counter!(zones_total_name, "store" => "forwarder");
-        #[cfg(feature = "blocklist")]
-        let zones_blocklist = counter!(zones_total_name, "store" => "blocklist");
-        #[cfg(feature = "recursor")]
-        let zones_recursor = counter!(zones_total_name, "store" => "recursor");
 
         Self {
             #[cfg(feature = "resolver")]
             zones_forwarder,
-            #[cfg(feature = "blocklist")]
-            zones_blocklist,
-            #[cfg(feature = "recursor")]
-            zones_recursor,
         }
     }
 
@@ -522,17 +490,8 @@ impl ConfigMetrics {
         match &zone.zone_type_config {
             ZoneTypeConfig::External { stores } => {
                 for store in stores {
-                    #[cfg(feature = "resolver")]
                     if let ExternalStoreConfig::Forward(_) = store {
                         self.zones_forwarder.increment(1)
-                    }
-                    #[cfg(feature = "blocklist")]
-                    if let ExternalStoreConfig::Blocklist(_) = store {
-                        self.zones_blocklist.increment(1)
-                    }
-                    #[cfg(feature = "recursor")]
-                    if let ExternalStoreConfig::Recursor(_) = store {
-                        self.zones_recursor.increment(1)
                     }
                 }
             }
