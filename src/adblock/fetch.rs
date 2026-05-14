@@ -97,10 +97,12 @@ async fn fetch_filter_from_network(
         )
     })?;
 
-    response
-        .text()
+    let bytes = response
+        .bytes()
         .await
-        .map_err(|err| format!("failed to read filter body from {}: {err}", filter.url))
+        .map_err(|err| format!("failed to read filter body from {}: {err}", filter.url))?;
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn persist_cached_filter(cache_path: &Path, contents: &str) -> Result<(), String> {
