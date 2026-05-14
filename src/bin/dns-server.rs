@@ -57,7 +57,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use dns_server::Config;
+use dns_server::{CompiledRuleSets, Config};
 #[cfg(all(feature = "metrics", feature = "resolver"))]
 use dns_server::ExternalStoreConfig;
 #[cfg(feature = "prometheus-metrics")]
@@ -192,6 +192,10 @@ async fn async_run(args: Cli) -> Result<(), String> {
 
     let config = Config::read_config(config_path)
         .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
+    let adblock_rules = match config.adblock_runtime_config() {
+        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config).await?),
+        None => None,
+    };
     let directory_config = config.directory().to_path_buf();
     let zonedir = args.zonedir.clone();
     let zone_dir: PathBuf = zonedir
@@ -250,7 +254,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
             .zone()
             .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
 
-        match zone.load(&zone_dir).await {
+        match zone.load(&zone_dir, adblock_rules.as_ref()).await {
             Ok(authority) => catalog.upsert(zone_name.into(), authority),
             Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
         }

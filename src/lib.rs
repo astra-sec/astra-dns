@@ -46,9 +46,11 @@ use hickory_server::{
 };
 use tracing::{debug, info, warn};
 
+mod adblock;
 #[cfg(feature = "prometheus-metrics")]
 mod prometheus_server;
 
+pub use adblock::{AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterConfig, FilteringConfig};
 #[cfg(feature = "prometheus-metrics")]
 pub use prometheus_server::PrometheusServer;
 
@@ -104,6 +106,15 @@ pub struct Config {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_with_file")]
     zones: Vec<ZoneConfig>,
+    /// Remote filter lists inspired by AdGuard Home's `filters`
+    #[serde(default)]
+    filters: Vec<FilterConfig>,
+    /// Local rules inspired by AdGuard Home's `user_rules`
+    #[serde(default)]
+    user_rules: Vec<String>,
+    /// Blocking behavior inspired by AdGuard Home's `filtering`
+    #[serde(default)]
+    filtering: FilteringConfig,
     /// Networks denied to access the server
     #[serde(default)]
     deny_networks: Vec<IpNet>,
@@ -208,6 +219,30 @@ impl Config {
         &self.zones
     }
 
+    pub fn filters(&self) -> &[FilterConfig] {
+        &self.filters
+    }
+
+    pub fn user_rules(&self) -> &[String] {
+        &self.user_rules
+    }
+
+    pub fn filtering(&self) -> &FilteringConfig {
+        &self.filtering
+    }
+
+    pub fn adblock_runtime_config(&self) -> Option<AdblockRuntimeConfig> {
+        if !adblock::is_adblock_enabled(&self.filters, &self.user_rules, &self.filtering) {
+            return None;
+        }
+
+        Some(AdblockRuntimeConfig {
+            filters: self.filters.clone(),
+            user_rules: self.user_rules.clone(),
+            filtering: self.filtering.clone(),
+        })
+    }
+
     /// get the networks denied access to this server
     pub fn deny_networks(&self) -> &[IpNet] {
         &self.deny_networks
@@ -282,7 +317,11 @@ pub struct ZoneConfig {
 
 impl ZoneConfig {
     #[warn(clippy::wildcard_enum_match_arm)] // make sure all cases are handled despite of non_exhaustive
-    pub async fn load(&self, zone_dir: &Path) -> Result<Vec<Arc<dyn AuthorityObject>>, String> {
+    pub async fn load(
+        &self,
+        zone_dir: &Path,
+        adblock_rules: Option<&CompiledRuleSets>,
+    ) -> Result<Vec<Arc<dyn AuthorityObject>>, String> {
         debug!("loading zone with config: {self:#?}");
 
         let zone_name = self
@@ -371,6 +410,16 @@ impl ZoneConfig {
                         }
                         #[cfg(feature = "resolver")]
                         ExternalStoreConfig::Forward(config) => {
+                            if let Some(adblock_rules) = adblock_rules {
+                                let chained = adblock::build_authorities(
+                                    zone_name.clone(),
+                                    config.clone(),
+                                    adblock_rules,
+                                )?;
+                                authorities.extend(chained);
+                                continue;
+                            }
+
                             let forwarder = ForwardAuthority::builder_tokio(config.clone())
                                 .with_origin(zone_name.clone())
                                 .build()?;
