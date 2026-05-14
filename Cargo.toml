@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["sqlite", "resolver", "rustls-platform-verifier", "recursor", "blocklist"]
+default = ["resolver", "rustls-platform-verifier", "recursor", "blocklist"]
 
 ascii-art = []
 blocklist = []
 recursor = []
 # Recursive Resolution is Experimental!
 resolver = []
-sqlite = []
 prometheus-metrics = []
 metrics = []
 rustls-platform-verifier = []
@@ -23,7 +22,7 @@ clap = { version = "4.0", features = ["std", "derive"] }
 hickory-client = { version = "0.25.2" }
 hickory-recursor = { version = "0.25.2" }
 hickory-resolver = { version = "0.25.2" }
-hickory-server = { version = "0.25.2", features = ["resolver", "sqlite", "recursor", "blocklist"] }
+hickory-server = { version = "0.25.2", features = ["resolver", "recursor", "blocklist"] }
 hickory-proto = { version = "0.25.2", features = ["std"] }
 ipnet = { version = "2.3.0" }
 libc = "0.2"

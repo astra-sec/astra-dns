@@ -14,7 +14,7 @@ use std::{
     fs::File,
     io::Read,
     net::{AddrParseError, Ipv4Addr, Ipv6Addr},
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -29,7 +29,6 @@ use hickory_proto::{ProtoError, rr::Name};
 use hickory_server::store::blocklist::BlocklistAuthority;
 #[cfg(feature = "blocklist")]
 use hickory_server::store::blocklist::BlocklistConfig;
-use hickory_server::store::file::FileConfig;
 #[cfg(feature = "resolver")]
 use hickory_server::store::forwarder::ForwardAuthority;
 #[cfg(feature = "resolver")]
@@ -38,12 +37,7 @@ use hickory_server::store::forwarder::ForwardConfig;
 use hickory_server::store::recursor::RecursiveAuthority;
 #[cfg(feature = "recursor")]
 use hickory_server::store::recursor::RecursiveConfig;
-#[cfg(feature = "sqlite")]
-use hickory_server::store::sqlite::{SqliteAuthority, SqliteConfig};
-use hickory_server::{
-    authority::{AuthorityObject, ZoneType},
-    store::file::FileAuthority,
-};
+use hickory_server::authority::{AuthorityObject, ZoneType};
 use tracing::{debug, info, warn};
 
 mod adblock;
@@ -104,7 +98,6 @@ pub struct Config {
     pub group: Option<String>,
     /// List of configurations for zones
     #[serde(default)]
-    #[serde(deserialize_with = "deserialize_with_file")]
     zones: Vec<ZoneConfig>,
     /// Remote filter lists inspired by AdGuard Home's `filters`
     #[serde(default)]
@@ -254,57 +247,6 @@ impl Config {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct ZoneConfigWithFile {
-    file: Option<PathBuf>,
-    #[serde(flatten)]
-    config: ZoneConfig,
-}
-
-fn deserialize_with_file<'de, D>(deserializer: D) -> Result<Vec<ZoneConfig>, D::Error>
-where
-    D: Deserializer<'de>,
-    D::Error: serde::de::Error,
-{
-    Vec::<ZoneConfigWithFile>::deserialize(deserializer)?
-        .into_iter()
-        .map(|ZoneConfigWithFile { file, mut config }| match file {
-            Some(file) => match &mut config.zone_type_config {
-                ZoneTypeConfig::Primary(server_config)
-                | ZoneTypeConfig::Secondary(server_config) => {
-                    if server_config
-                        .stores
-                        .iter()
-                        .any(|store| matches!(store, ServerStoreConfig::File(_)))
-                    {
-                        Err(<D::Error as serde::de::Error>::custom(
-                            "having `file` and `[zones.store]` item with type `file` is ambiguous",
-                        ))
-                    } else {
-                        let store = ServerStoreConfig::File(FileConfig {
-                            zone_file_path: file,
-                        });
-
-                        if server_config.stores.len() == 1
-                            && matches!(&server_config.stores[0], ServerStoreConfig::Default)
-                        {
-                            server_config.stores[0] = store;
-                        } else {
-                            server_config.stores.push(store);
-                        }
-                        Ok(config)
-                    }
-                }
-                _ => Err(<D::Error as serde::de::Error>::custom(
-                    "cannot use `file` on a zone that is not primary or secondary",
-                )),
-            },
-
-            _ => Ok(config),
-        })
-        .collect::<Result<Vec<_>, _>>()
-}
-
 /// Configuration for a zone
 #[derive(Deserialize, Debug)]
 pub struct ZoneConfig {
@@ -351,47 +293,6 @@ impl ZoneConfig {
         };
 
         match &self.zone_type_config {
-            ZoneTypeConfig::Primary(server_config) | ZoneTypeConfig::Secondary(server_config) => {
-                debug!(
-                    "loading authorities for {zone_name} with stores {:?}",
-                    server_config.stores
-                );
-
-                let is_axfr_allowed = server_config.is_axfr_allowed();
-                for store in &server_config.stores {
-                    let authority: Arc<dyn AuthorityObject> = match store {
-                        #[cfg(feature = "sqlite")]
-                        ServerStoreConfig::Sqlite(config) => {
-                            let authority = SqliteAuthority::try_from_config(
-                                zone_name.clone(),
-                                zone_type,
-                                is_axfr_allowed,
-                                server_config.is_dnssec_enabled(),
-                                Some(zone_dir),
-                                config,
-                            )
-                            .await?;
-
-                            Arc::new(authority)
-                        }
-
-                        ServerStoreConfig::File(config) => {
-                            let authority = FileAuthority::try_from_config(
-                                zone_name.clone(),
-                                zone_type,
-                                is_axfr_allowed,
-                                Some(zone_dir),
-                                config,
-                            )?;
-
-                            Arc::new(authority)
-                        }
-                        _ => return Err("Unsupported store configuration".to_string()),
-                    };
-
-                    authorities.push(authority);
-                }
-            }
             ZoneTypeConfig::External { stores } => {
                 debug!(
                     "loading authorities for {zone_name} with stores {:?}",
@@ -459,8 +360,6 @@ impl ZoneConfig {
     /// the type of the zone
     pub fn zone_type(&self) -> ZoneType {
         match &self.zone_type_config {
-            ZoneTypeConfig::Primary { .. } => ZoneType::Primary,
-            ZoneTypeConfig::Secondary { .. } => ZoneType::Secondary,
             ZoneTypeConfig::External { .. } => ZoneType::External,
         }
     }
@@ -475,83 +374,12 @@ fn empty_stores_error<T>() -> Result<T, String> {
 #[serde(deny_unknown_fields)]
 /// Enumeration over each zone type's configuration.
 pub enum ZoneTypeConfig {
-    Primary(ServerZoneConfig),
-    Secondary(ServerZoneConfig),
     External {
-        /// Store configurations.  Note: we specify a default handler to get a Vec containing a
-        /// StoreConfig::Default, which is used for authoritative file-based zones and legacy sqlite
-        /// configurations. #[serde(default)] cannot be used, because it will invoke Default for Vec,
-        /// i.e., an empty Vec and we cannot implement Default for StoreConfig and return a Vec.  The
-        /// custom visitor is used to handle map (single store) or sequence (chained store) configurations.
+        /// Store configurations. This accepts either a single YAML map or a sequence of maps.
         #[serde(default = "store_config_default")]
         #[serde(deserialize_with = "store_config_visitor")]
         stores: Vec<ExternalStoreConfig>,
     },
-}
-
-impl ZoneTypeConfig {
-    pub fn as_server(&self) -> Option<&ServerZoneConfig> {
-        match self {
-            Self::Primary(c) | Self::Secondary(c) => Some(c),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct ServerZoneConfig {
-    /// Allow AXFR (TODO: need auth)
-    pub allow_axfr: Option<bool>,
-    /// Store configurations.  Note: we specify a default handler to get a Vec containing a
-    /// StoreConfig::Default, which is used for authoritative file-based zones and legacy sqlite
-    /// configurations. #[serde(default)] cannot be used, because it will invoke Default for Vec,
-    /// i.e., an empty Vec and we cannot implement Default for StoreConfig and return a Vec.  The
-    /// custom visitor is used to handle map (single store) or sequence (chained store) configurations.
-    #[serde(default = "store_config_default")]
-    #[serde(deserialize_with = "store_config_visitor")]
-    pub stores: Vec<ServerStoreConfig>,
-}
-
-impl ServerZoneConfig {
-    /// path to the zone file, i.e. the base set of original records in the zone
-    ///
-    /// this is only used on first load, if dynamic update is enabled for the zone, then the journal
-    /// file is the actual source of truth for the zone.
-    pub fn file(&self) -> Option<&Path> {
-        self.stores.iter().find_map(|store| match store {
-            ServerStoreConfig::File(file_config) => Some(&*file_config.zone_file_path),
-            #[cfg(feature = "sqlite")]
-            ServerStoreConfig::Sqlite(sqlite_config) => Some(&*sqlite_config.zone_file_path),
-            ServerStoreConfig::Default => None,
-        })
-    }
-
-    /// enable AXFR transfers
-    pub fn is_axfr_allowed(&self) -> bool {
-        self.allow_axfr.unwrap_or(false)
-    }
-
-    /// declare that this zone should be signed, see keys for configuration of the keys for signing
-    pub fn is_dnssec_enabled(&self) -> bool {
-        false
-    }
-}
-
-/// Enumeration over store types for secondary nameservers.
-#[derive(Deserialize, Debug, Default)]
-#[serde(tag = "type")]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum ServerStoreConfig {
-    /// File based configuration
-    File(FileConfig),
-    /// Sqlite based configuration file
-    #[cfg(feature = "sqlite")]
-    Sqlite(SqliteConfig),
-    /// This is used by the configuration processing code to represent a deprecated or main-block config without an associated store.
-    #[default]
-    Default,
 }
 
 /// Enumeration over store types for external nameservers.

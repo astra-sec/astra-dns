@@ -2,10 +2,11 @@
 
 `dns-server` is a Rust DNS server built on top of Hickory DNS.
 
-The project started as a small `named`-style Hickory wrapper with custom YAML
-configuration. It now also includes the first slice of an ad-blocking pipeline:
-remote filter download, local user rules, sinkhole or `NXDOMAIN` blocking, and
-simple hosts-style overrides, all chained in front of the upstream forwarder.
+The project started as a small Hickory-based DNS wrapper with custom YAML
+configuration. It now focuses on a router-friendly forwarding and filtering
+pipeline: remote filter download, local user rules, sinkhole or `NXDOMAIN`
+blocking, and simple hosts-style overrides, all chained in front of the
+upstream forwarder.
 
 ## Current Status
 
@@ -79,15 +80,15 @@ That ordering gives the current effective precedence:
 
 ## Config Model
 
-The server still supports the original DNS server settings:
+The server supports these core DNS settings:
 
 - listen IPv4 / IPv6 addresses
 - listen port
 - TCP / UDP enable or disable
 - TCP timeout
 - access control with `allow_networks` and `deny_networks`
-- `Primary`, `Secondary`, and `External` zones
-- `file`, `sqlite`, `forward`, `blocklist`, and `recursor` stores
+- `External` zones
+- `forward`, `blocklist`, and `recursor` stores
 
 For ad-blocking, the server now imports a focused subset inspired by AdGuard
 Home:

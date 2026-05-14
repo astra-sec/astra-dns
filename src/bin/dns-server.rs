@@ -63,7 +63,7 @@ use dns_server::ExternalStoreConfig;
 #[cfg(feature = "prometheus-metrics")]
 use dns_server::PrometheusServer;
 #[cfg(feature = "metrics")]
-use dns_server::{ServerStoreConfig, ServerZoneConfig, ZoneConfig, ZoneTypeConfig};
+use dns_server::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{authority::Catalog, server::ServerFuture};
 
 /// Cli struct for all options managed with clap derive api.
@@ -462,13 +462,10 @@ where
 struct ConfigMetrics {
     #[cfg(feature = "resolver")]
     zones_forwarder: Counter,
-
-    zones_file_primary: Counter,
-    zones_file_secondary: Counter,
-    #[cfg(feature = "sqlite")]
-    zones_sqlite_primary: Counter,
-    #[cfg(feature = "sqlite")]
-    zones_sqlite_secondary: Counter,
+    #[cfg(feature = "blocklist")]
+    zones_blocklist: Counter,
+    #[cfg(feature = "recursor")]
+    zones_recursor: Counter,
 }
 
 #[cfg(feature = "metrics")]
@@ -497,9 +494,6 @@ impl ConfigMetrics {
         hickory_config_info.set(1);
 
         let zones_total_name = "hickory_zones_total";
-        let zones_file_primary = counter!(zones_total_name, "store" => "file", "role" => "primary");
-        let zones_file_secondary =
-            counter!(zones_total_name, "store" => "file", "role" => "secondary");
 
         describe_counter!(
             zones_total_name,
@@ -509,60 +503,39 @@ impl ConfigMetrics {
 
         #[cfg(feature = "resolver")]
         let zones_forwarder = counter!(zones_total_name, "store" => "forwarder");
-
-        #[cfg(feature = "sqlite")]
-        let (zones_sqlite_primary, zones_sqlite_secondary) = {
-            let zones_primary_sqlite =
-                counter!(zones_total_name, "store" => "sqlite", "role" => "primary");
-            let zones_secondary_sqlite =
-                counter!(zones_total_name, "store" => "sqlite", "role" => "secondary");
-            (zones_primary_sqlite, zones_secondary_sqlite)
-        };
+        #[cfg(feature = "blocklist")]
+        let zones_blocklist = counter!(zones_total_name, "store" => "blocklist");
+        #[cfg(feature = "recursor")]
+        let zones_recursor = counter!(zones_total_name, "store" => "recursor");
 
         Self {
             #[cfg(feature = "resolver")]
             zones_forwarder,
-            #[cfg(feature = "sqlite")]
-            zones_sqlite_primary,
-            zones_file_primary,
-            #[cfg(feature = "sqlite")]
-            zones_sqlite_secondary,
-            zones_file_secondary,
+            #[cfg(feature = "blocklist")]
+            zones_blocklist,
+            #[cfg(feature = "recursor")]
+            zones_recursor,
         }
     }
 
     fn increment_zone_metrics(&self, zone: &ZoneConfig) {
         match &zone.zone_type_config {
-            ZoneTypeConfig::Primary(server_config) => self.increment_stores(server_config, true),
-            ZoneTypeConfig::Secondary(server_config) => self.increment_stores(server_config, false),
             ZoneTypeConfig::External { stores } => {
                 for store in stores {
                     #[cfg(feature = "resolver")]
                     if let ExternalStoreConfig::Forward(_) = store {
                         self.zones_forwarder.increment(1)
                     }
+                    #[cfg(feature = "blocklist")]
+                    if let ExternalStoreConfig::Blocklist(_) = store {
+                        self.zones_blocklist.increment(1)
+                    }
+                    #[cfg(feature = "recursor")]
+                    if let ExternalStoreConfig::Recursor(_) = store {
+                        self.zones_recursor.increment(1)
+                    }
                 }
             }
-        }
-    }
-
-    fn increment_stores(&self, server_config: &ServerZoneConfig, primary: bool) {
-        for store in &server_config.stores {
-            if matches!(store, ServerStoreConfig::File(_)) {
-                if primary {
-                    self.zones_file_primary.increment(1)
-                } else {
-                    self.zones_file_secondary.increment(1)
-                }
-            }
-            #[cfg(feature = "sqlite")]
-            if matches!(store, ServerStoreConfig::Sqlite(_)) {
-                if primary {
-                    self.zones_sqlite_primary.increment(1)
-                } else {
-                    self.zones_sqlite_secondary.increment(1)
-                }
-            };
         }
     }
 }
