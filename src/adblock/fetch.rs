@@ -11,12 +11,14 @@ use tracing::{info, warn};
 
 use super::FilterConfig;
 
-const DEFAULT_FILTER_FETCH_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_FILTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_FILTER_READ_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
 pub struct FilterFetchOptions {
     cache_dir: PathBuf,
-    timeout: Duration,
+    connect_timeout: Duration,
+    read_timeout: Duration,
 }
 
 impl FilterFetchOptions {
@@ -28,7 +30,8 @@ impl FilterFetchOptions {
 
         Self {
             cache_dir: cache_root,
-            timeout: Duration::from_secs(DEFAULT_FILTER_FETCH_TIMEOUT_SECS),
+            connect_timeout: Duration::from_secs(DEFAULT_FILTER_CONNECT_TIMEOUT_SECS),
+            read_timeout: Duration::from_secs(DEFAULT_FILTER_READ_TIMEOUT_SECS),
         }
     }
 
@@ -49,7 +52,7 @@ pub async fn fetch_filter(
 ) -> Result<String, String> {
     let cache_path = options.cache_path_for(filter);
 
-    match fetch_filter_from_network(filter, options.timeout).await {
+    match download_filter_body(filter, options.connect_timeout, options.read_timeout).await {
         Ok(contents) => {
             persist_cached_filter(&cache_path, &contents)?;
             info!(
@@ -74,37 +77,6 @@ pub async fn fetch_filter(
     }
 }
 
-async fn fetch_filter_from_network(
-    filter: &FilterConfig,
-    timeout: Duration,
-) -> Result<String, String> {
-    let client = Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .build()
-        .map_err(|err| format!("failed to build HTTP client for filters: {err}"))?;
-
-    let response = client
-        .get(&filter.url)
-        .send()
-        .await
-        .map_err(|err| format!("failed to download filter {}: {err}", filter.url))?;
-
-    let response = response.error_for_status().map_err(|err| {
-        format!(
-            "filter download returned an error for {}: {err}",
-            filter.url
-        )
-    })?;
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read filter body from {}: {err}", filter.url))?;
-
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
 fn persist_cached_filter(cache_path: &Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -117,4 +89,38 @@ fn persist_cached_filter(cache_path: &Path, contents: &str) -> Result<(), String
 
     fs::write(cache_path, contents)
         .map_err(|err| format!("failed to write filter cache {:?}: {err}", cache_path))
+}
+
+async fn download_filter_body(
+    filter: &FilterConfig,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<String, String> {
+    // Remote lists can be several megabytes on small routers, so use a short
+    // connect timeout but avoid a hard total request deadline for the body.
+    let client = Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .map_err(|err| format!("failed to build HTTP client for filters: {err}"))?;
+
+    let response = client
+        .get(&filter.url)
+        .send()
+        .await
+        .map_err(|err| format!("failed to download filter {}: {err:?}", filter.url))?;
+
+    let response = response.error_for_status().map_err(|err| {
+        format!(
+            "filter download returned an error for {}: {err:?}",
+            filter.url
+        )
+    })?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("failed to read filter body from {}: {err:?}", filter.url))?;
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
