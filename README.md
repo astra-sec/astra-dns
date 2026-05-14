@@ -20,6 +20,7 @@ The current implementation has been verified with:
 - `cargo build`
 - `cargo test`
 - live DNS queries against a local test setup
+- config validation against the filter sources listed in `config.all.yaml`
 
 ## What It Does Today
 
@@ -62,15 +63,19 @@ The ad-blocking logic is intentionally split into its own module tree:
 At startup, the ad-blocking path is assembled as:
 
 1. `OverrideAuthority`
+2. `RewriteAuthority`
 2. `BlockAuthority`
 3. Hickory `ForwardAuthority`
 
 That ordering gives the current effective precedence:
 
 1. exact hosts-style override
-2. allowlist
-3. blocklist
-4. upstream forwarding
+2. rewrite override
+3. important allow rules
+4. important block rules
+5. normal allow rules
+6. normal block rules
+7. upstream forwarding
 
 ## Config Model
 
@@ -103,12 +108,17 @@ Remote filter lists currently support:
 - plain domains such as `ads.example.com`
 - hosts-style entries such as `0.0.0.0 ads.example.com`
 - AdGuard / ABP-style domain rules such as `||ads.example.com^`
+- wildcard domain rules such as `||ac*.786ip.com^` or `||ping.*.sogou.com^`
+- anchored patterns such as `|load.gtm.` and `|c.blue.*.com^|`
+- leading-dot patterns such as `.bbelements.com^`
+- regex rules such as `/^(\S+\.)?analytics(\-|\.)/`
 
 Local `user_rules` currently support:
 
 - allow rules such as `@@||good.example.com^`
 - block rules such as `||ads.example.com^`
 - hosts-style overrides such as `1.2.3.4 internal.example.com`
+- the same wildcard, anchor, and regex forms accepted in remote filters
 
 Currently supported `filtering.rewrites` shapes:
 
@@ -124,6 +134,21 @@ Currently supported blocking modes:
 - `nxdomain`
   returns `NXDOMAIN`
 
+Currently supported AdGuard-style modifiers:
+
+- `$important`
+- `$badfilter`
+- `$dnstype=...`
+- `$denyallow=...`
+
+These were specifically extended to cover the rule formats present in the
+filter sources referenced by `config.all.yaml`:
+
+- AdGuard DNS filter
+- AdAway hosts
+- anti-AD
+- 217heidai
+
 ## What Is Not Supported Yet
 
 This repository is not yet a full AdGuard Home replacement.
@@ -131,8 +156,7 @@ This repository is not yet a full AdGuard Home replacement.
 Notably missing:
 
 - full AdGuard Home rule syntax compatibility
-- rule modifiers such as rich `$modifier` behavior
-- regex rules
+- most non-DNS ABP / AdGuard modifiers
 - client-specific filtering
 - periodic filter refresh
 - on-disk filter cache
@@ -144,6 +168,13 @@ Notably missing:
 - full rewrite syntax from `config.all.yaml` beyond the currently implemented
   `domain`, wildcard-domain, `ip`, and `cname` patterns
 - complete DoH / DoT / DoQ product wiring
+
+Some ABP-style rules are intentionally out of scope for now even if they can be
+parsed elsewhere in the ecosystem:
+
+- browser or HTTP request-context modifiers
+- cosmetic filtering syntax
+- script / resource-type specific behavior that has no DNS equivalent
 
 ## How To Run
 
@@ -232,8 +263,8 @@ zones:
 
 ## About `config.all.yaml`
 
-[config.all.yaml](./config.all.yaml) should currently be treated as a reference
-document, not as a fully supported contract.
+`config.all.yaml` should currently be treated as a reference document, not as a
+fully supported contract.
 
 It is useful for:
 

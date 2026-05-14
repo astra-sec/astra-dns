@@ -5,7 +5,9 @@ use std::{
 };
 
 use ipnet::IpNet;
+use regex::Regex;
 use tracing::warn;
+use hickory_proto::rr::RecordType;
 
 use super::{
     BlockingMode, FilterConfig, FilteringConfig,
@@ -33,6 +35,8 @@ pub struct RuleSets {
     pub block_subdomains: HashSet<String>,
     pub allow_exact: HashSet<String>,
     pub allow_subdomains: HashSet<String>,
+    pub block_rules: Vec<CompiledMatchRule>,
+    pub allow_rules: Vec<CompiledMatchRule>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +46,8 @@ pub struct CompiledRuleSets {
     pub block_subdomains: HashSet<String>,
     pub allow_exact: HashSet<String>,
     pub allow_subdomains: HashSet<String>,
+    pub block_rules: Vec<CompiledMatchRule>,
+    pub allow_rules: Vec<CompiledMatchRule>,
     pub domain_rewrites: Vec<DomainRewriteRule>,
     pub answer_ip_rewrites: Vec<AnswerIpRewriteRule>,
     pub cname_rewrites: Vec<CnameRewriteRule>,
@@ -75,6 +81,26 @@ pub enum DomainPattern {
     WildcardSuffix(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct CompiledMatchRule {
+    pub raw_text: String,
+    pub matcher: Matcher,
+    pub important: bool,
+    pub dnstypes: Option<TypeConstraint>,
+    pub denyallow: Vec<DomainPattern>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Matcher {
+    Regex(Regex),
+}
+
+#[derive(Clone, Debug)]
+pub enum TypeConstraint {
+    Include(HashSet<RecordType>),
+    Exclude(HashSet<RecordType>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuleDisposition {
     Block,
@@ -90,15 +116,18 @@ enum RuleOrigin {
 impl CompiledRuleSets {
     pub async fn build(config: AdblockRuntimeConfig) -> Result<Self, String> {
         let mut rules = RuleSets::default();
+        let mut disabled_rules = HashSet::new();
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
             let contents = fetch_filter(filter).await?;
-            parse_rule_lines(&contents, RuleOrigin::RemoteFilter, &mut rules);
+            parse_rule_lines(&contents, RuleOrigin::RemoteFilter, &mut rules, &mut disabled_rules)?;
         }
 
         for line in &config.user_rules {
-            parse_rule_line(line, RuleOrigin::UserRule, &mut rules);
+            parse_rule_line(line, RuleOrigin::UserRule, &mut rules, &mut disabled_rules)?;
         }
+
+        apply_badfilters(&mut rules, &disabled_rules);
 
         Ok(Self {
             overrides: rules.overrides,
@@ -106,6 +135,8 @@ impl CompiledRuleSets {
             block_subdomains: rules.block_subdomains,
             allow_exact: rules.allow_exact,
             allow_subdomains: rules.allow_subdomains,
+            block_rules: rules.block_rules,
+            allow_rules: rules.allow_rules,
             domain_rewrites: compile_domain_rewrites(&config.filtering.rewrites)?,
             answer_ip_rewrites: compile_answer_ip_rewrites(&config.filtering.rewrites)?,
             cname_rewrites: compile_cname_rewrites(&config.filtering.rewrites)?,
@@ -117,21 +148,32 @@ impl CompiledRuleSets {
     }
 }
 
-fn parse_rule_lines(contents: &str, origin: RuleOrigin, rules: &mut RuleSets) {
+fn parse_rule_lines(
+    contents: &str,
+    origin: RuleOrigin,
+    rules: &mut RuleSets,
+    disabled_rules: &mut HashSet<String>,
+) -> Result<(), String> {
     for line in contents.lines() {
-        parse_rule_line(line, origin, rules);
+        parse_rule_line(line, origin, rules, disabled_rules)?;
     }
+    Ok(())
 }
 
-fn parse_rule_line(line: &str, origin: RuleOrigin, rules: &mut RuleSets) {
+fn parse_rule_line(
+    line: &str,
+    origin: RuleOrigin,
+    rules: &mut RuleSets,
+    disabled_rules: &mut HashSet<String>,
+) -> Result<(), String> {
     let line = strip_comments(line).trim();
     if line.is_empty() {
-        return;
+        return Ok(());
     }
 
-    if let Some((disposition, domain, include_subdomains)) = parse_adblock_domain_rule(line) {
+    if let Some((disposition, domain, include_subdomains)) = parse_simple_adblock_domain_rule(line) {
         add_domain_rule(disposition, &domain, include_subdomains, rules);
-        return;
+        return Ok(());
     }
 
     if let Some((ip, domains)) = parse_hosts_rule(line) {
@@ -147,33 +189,56 @@ fn parse_rule_line(line: &str, origin: RuleOrigin, rules: &mut RuleSets) {
                 }
             }
         }
-        return;
+        return Ok(());
     }
 
     if let Some(domain) = normalize_domain(line) {
         add_domain_rule(RuleDisposition::Block, &domain, false, rules);
-        return;
+        return Ok(());
+    }
+
+    if let Some(rule) = parse_complex_rule(line)? {
+        if rule.raw_text.ends_with("$badfilter") {
+            let target = rule
+                .raw_text
+                .trim_end_matches("$badfilter")
+                .trim_end_matches(',');
+            disabled_rules.insert(target.to_string());
+            return Ok(());
+        }
+
+        match origin {
+            RuleOrigin::RemoteFilter | RuleOrigin::UserRule => match line.starts_with("@@") {
+                true => rules.allow_rules.push(rule),
+                false => rules.block_rules.push(rule),
+            },
+        }
+        return Ok(());
     }
 
     warn!("skipping unsupported rule line: {line}");
+    Ok(())
 }
 
 fn strip_comments(line: &str) -> &str {
-    for marker in ['#', '!'] {
-        if let Some((head, _)) = line.split_once(marker) {
-            return head;
-        }
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with('!') {
+        return "";
     }
 
     line
 }
 
-fn parse_adblock_domain_rule(line: &str) -> Option<(RuleDisposition, String, bool)> {
+fn parse_simple_adblock_domain_rule(line: &str) -> Option<(RuleDisposition, String, bool)> {
     let (disposition, remainder) = if let Some(rest) = line.strip_prefix("@@") {
         (RuleDisposition::Allow, rest)
     } else {
         (RuleDisposition::Block, line)
     };
+
+    if remainder.contains('$') || remainder.contains('*') || remainder.starts_with('/') {
+        return None;
+    }
 
     let remainder = remainder.strip_prefix("||")?;
     let remainder = remainder.split('$').next().unwrap_or(remainder);
@@ -182,6 +247,174 @@ fn parse_adblock_domain_rule(line: &str) -> Option<(RuleDisposition, String, boo
     let remainder = remainder.trim();
     let domain = normalize_domain(remainder)?;
     Some((disposition, domain, true))
+}
+
+fn parse_complex_rule(line: &str) -> Result<Option<CompiledMatchRule>, String> {
+    let raw_text = line.to_string();
+    let line = line.strip_prefix("@@").unwrap_or(line);
+    let (pattern, modifier_text) = split_pattern_and_modifiers(line)?;
+
+    let modifiers = parse_modifiers(modifier_text)?;
+
+    let matcher = if pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() >= 2 {
+        Matcher::Regex(
+            Regex::new(&pattern[1..pattern.len() - 1])
+                .map_err(|err| format!("invalid regex rule {pattern}: {err}"))?,
+        )
+    } else {
+        let regex = adblock_pattern_to_regex(pattern)?;
+        Matcher::Regex(regex)
+    };
+
+    Ok(Some(CompiledMatchRule {
+        raw_text,
+        matcher,
+        important: modifiers.important,
+        dnstypes: modifiers.dnstypes,
+        denyallow: modifiers.denyallow,
+    }))
+}
+
+fn split_pattern_and_modifiers(line: &str) -> Result<(&str, Option<&str>), String> {
+    if !line.starts_with('/') {
+        return Ok(match line.split_once('$') {
+            Some((pattern, modifiers)) => (pattern, Some(modifiers)),
+            None => (line, None),
+        });
+    }
+
+    let bytes = line.as_bytes();
+    let mut escaped = false;
+    for index in 1..bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'/' {
+            if index + 1 < bytes.len() && bytes[index + 1] == b'$' {
+                return Ok((&line[..=index], Some(&line[index + 2..])));
+            }
+            if index + 1 == bytes.len() {
+                return Ok((line, None));
+            }
+        }
+    }
+
+    Err(format!("unterminated regex rule: {line}"))
+}
+
+#[derive(Default)]
+struct ParsedModifiers {
+    important: bool,
+    dnstypes: Option<TypeConstraint>,
+    denyallow: Vec<DomainPattern>,
+}
+
+fn parse_modifiers(modifier_text: Option<&str>) -> Result<ParsedModifiers, String> {
+    let Some(modifier_text) = modifier_text else {
+        return Ok(ParsedModifiers::default());
+    };
+
+    let mut parsed = ParsedModifiers::default();
+    for modifier in modifier_text.split(',') {
+        let modifier = modifier.trim();
+        if modifier.is_empty() {
+            continue;
+        }
+        if modifier == "important" || modifier == "badfilter" {
+            parsed.important = modifier == "important";
+            continue;
+        }
+        if let Some(value) = modifier.strip_prefix("dnstype=") {
+            parsed.dnstypes = Some(parse_dnstype_modifier(value)?);
+            continue;
+        }
+        if let Some(value) = modifier.strip_prefix("denyallow=") {
+            parsed.denyallow = value
+                .split('|')
+                .map(parse_domain_pattern)
+                .collect::<Result<Vec<_>, _>>()?;
+            continue;
+        }
+
+        return Err(format!("unsupported modifier: {modifier}"));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_dnstype_modifier(value: &str) -> Result<TypeConstraint, String> {
+    let values: Vec<&str> = value.split('|').filter(|v| !v.is_empty()).collect();
+    let exclude = values.iter().all(|v| v.starts_with('~'));
+    let include = values.iter().all(|v| !v.starts_with('~'));
+    if !exclude && !include {
+        return Err(format!("mixed include/exclude dnstype modifier is unsupported: {value}"));
+    }
+
+    let mut types = HashSet::new();
+    for value in values {
+        let value = value.trim_start_matches('~').to_ascii_uppercase();
+        types.insert(
+            RecordType::from_str(&value)
+                .map_err(|_| format!("invalid dnstype value: {value}"))?,
+        );
+    }
+
+    Ok(if exclude {
+        TypeConstraint::Exclude(types)
+    } else {
+        TypeConstraint::Include(types)
+    })
+}
+
+fn adblock_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
+    let mut regex = String::from("^");
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+
+    if pattern.starts_with("||") {
+        regex.push_str("(?:^|.*\\.)");
+        i = 2;
+    } else if pattern.starts_with('|') {
+        i = 1;
+    } else if pattern.starts_with('.') {
+        regex.push_str("(?:.*\\.)?");
+        i = 1;
+    } else {
+        regex.push_str(".*");
+    }
+
+    while i < chars.len() {
+        if i + 1 == chars.len() && chars[i] == '|' {
+            regex.push('$');
+            i += 1;
+            continue;
+        }
+
+        match chars[i] {
+            '*' => regex.push_str(".*"),
+            '^' => regex.push('$'),
+            '.' => regex.push_str("\\."),
+            '?' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' => {
+                regex.push('\\');
+                regex.push(chars[i]);
+            }
+            '|' => regex.push_str("\\|"),
+            c => regex.push(c),
+        }
+        i += 1;
+    }
+
+    if !regex.ends_with('$') {
+        regex.push_str(".*$");
+    }
+
+    Regex::new(&regex).map_err(|err| format!("invalid generated regex for {pattern}: {err}"))
 }
 
 fn parse_hosts_rule(line: &str) -> Option<(IpAddr, Vec<String>)> {
@@ -257,6 +490,50 @@ fn add_domain_rule(
             rules.block_exact.insert(domain.to_owned());
             if include_subdomains {
                 rules.block_subdomains.insert(domain.to_owned());
+            }
+        }
+    }
+}
+
+fn apply_badfilters(rules: &mut RuleSets, disabled_rules: &HashSet<String>) {
+    for disabled in disabled_rules {
+        if let Some((disposition, domain, include_subdomains)) =
+            parse_simple_adblock_domain_rule(disabled)
+        {
+            remove_domain_rule(disposition, &domain, include_subdomains, rules);
+            continue;
+        }
+        if let Some(domain) = normalize_domain(disabled) {
+            rules.block_exact.remove(&domain);
+            rules.allow_exact.remove(&domain);
+        }
+    }
+
+    rules
+        .block_rules
+        .retain(|rule| !disabled_rules.contains(&rule.raw_text));
+    rules
+        .allow_rules
+        .retain(|rule| !disabled_rules.contains(&rule.raw_text));
+}
+
+fn remove_domain_rule(
+    disposition: RuleDisposition,
+    domain: &str,
+    include_subdomains: bool,
+    rules: &mut RuleSets,
+) {
+    match disposition {
+        RuleDisposition::Allow => {
+            rules.allow_exact.remove(domain);
+            if include_subdomains {
+                rules.allow_subdomains.remove(domain);
+            }
+        }
+        RuleDisposition::Block => {
+            rules.block_exact.remove(domain);
+            if include_subdomains {
+                rules.block_subdomains.remove(domain);
             }
         }
     }
@@ -378,10 +655,11 @@ mod tests {
     #[test]
     fn parses_adblock_and_hosts_rules() {
         let mut rules = RuleSets::default();
+        let mut disabled = HashSet::new();
 
-        parse_rule_line("||ads.example.com^", RuleOrigin::RemoteFilter, &mut rules);
-        parse_rule_line("@@||good.example.com^", RuleOrigin::UserRule, &mut rules);
-        parse_rule_line("1.2.3.4 internal.example.com", RuleOrigin::UserRule, &mut rules);
+        parse_rule_line("||ads.example.com^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
+        parse_rule_line("@@||good.example.com^", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
+        parse_rule_line("1.2.3.4 internal.example.com", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
 
         assert!(rules.block_exact.contains("ads.example.com"));
         assert!(rules.block_subdomains.contains("ads.example.com"));
@@ -400,9 +678,10 @@ mod tests {
     #[test]
     fn allowlist_prevents_later_block_rule() {
         let mut rules = RuleSets::default();
+        let mut disabled = HashSet::new();
 
-        parse_rule_line("@@||video.example.com^", RuleOrigin::UserRule, &mut rules);
-        parse_rule_line("||video.example.com^", RuleOrigin::RemoteFilter, &mut rules);
+        parse_rule_line("@@||video.example.com^", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
+        parse_rule_line("||video.example.com^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
 
         assert!(!rules.block_exact.contains("video.example.com"));
         assert!(rules.allow_subdomains.contains("video.example.com"));
@@ -433,5 +712,42 @@ mod tests {
         let compiled = compile_domain_rewrites(&rewrites).expect("compile failed");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].answer.ipv4.len(), 2);
+    }
+
+    #[test]
+    fn parses_complex_rule_with_modifiers() {
+        let rule = parse_complex_rule(r"||*serror*.wo.com.cn^$dnstype=A|CNAME")
+            .expect("parse failed")
+            .expect("missing rule");
+        assert!(matches!(rule.dnstypes, Some(TypeConstraint::Include(_))));
+    }
+
+    #[test]
+    fn parses_regex_rule_with_modifiers() {
+        let rule = parse_complex_rule(r"/^(\S+\.)?9377[a-z0-9]{2}\.com$/$dnstype=A")
+            .expect("parse failed")
+            .expect("missing rule");
+        assert!(matches!(rule.dnstypes, Some(TypeConstraint::Include(_))));
+    }
+
+    #[test]
+    fn badfilter_disables_simple_rule() {
+        let mut rules = RuleSets::default();
+        let mut disabled = HashSet::new();
+
+        parse_rule_line("||pl.ua^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
+        parse_rule_line("||pl.ua^$badfilter", RuleOrigin::RemoteFilter, &mut rules, &mut disabled)
+            .unwrap();
+        apply_badfilters(&mut rules, &disabled);
+
+        assert!(!rules.block_subdomains.contains("pl.ua"));
+    }
+
+    #[test]
+    fn preserves_hash_inside_regex_rule() {
+        let rule = parse_complex_rule(r"/\.(gif|jpe?g|png|webp)#(\/?.+)?(\/(ad)s?\/|\/ad-)/")
+            .expect("parse failed")
+            .expect("missing rule");
+        assert!(matches!(rule.matcher, Matcher::Regex(_)));
     }
 }

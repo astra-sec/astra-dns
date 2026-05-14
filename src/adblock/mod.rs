@@ -64,7 +64,11 @@ fn block_authority(
     origin: Name,
     compiled: &CompiledRuleSets,
 ) -> Result<Option<Arc<dyn AuthorityObject>>, String> {
-    if compiled.block_exact.is_empty() && compiled.block_subdomains.is_empty() {
+    if compiled.block_exact.is_empty()
+        && compiled.block_subdomains.is_empty()
+        && compiled.block_rules.is_empty()
+        && compiled.allow_rules.is_empty()
+    {
         return Ok(None);
     }
 
@@ -74,6 +78,8 @@ fn block_authority(
         compiled.block_subdomains.clone(),
         compiled.allow_exact.clone(),
         compiled.allow_subdomains.clone(),
+        compiled.block_rules.clone(),
+        compiled.allow_rules.clone(),
         compiled.blocking_mode,
         compiled.blocking_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED),
         compiled.blocking_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED),

@@ -22,8 +22,8 @@ use hickory_server::{
 use super::{
     BlockingMode,
     rules::{
-        AnswerIpRewriteRule, CnameRewriteRule, DomainRewriteRule, OverrideRule,
-        domain_pattern_matches,
+        AnswerIpRewriteRule, CnameRewriteRule, CompiledMatchRule, DomainRewriteRule,
+        OverrideRule, TypeConstraint, domain_pattern_matches,
     },
 };
 
@@ -116,6 +116,8 @@ pub struct BlockAuthority {
     block_subdomains: HashSet<String>,
     allow_exact: HashSet<String>,
     allow_subdomains: HashSet<String>,
+    block_rules: Vec<CompiledMatchRule>,
+    allow_rules: Vec<CompiledMatchRule>,
     blocking_mode: BlockingMode,
     blocking_ipv4: Ipv4Addr,
     blocking_ipv6: Ipv6Addr,
@@ -153,6 +155,8 @@ impl BlockAuthority {
         block_subdomains: HashSet<String>,
         allow_exact: HashSet<String>,
         allow_subdomains: HashSet<String>,
+        block_rules: Vec<CompiledMatchRule>,
+        allow_rules: Vec<CompiledMatchRule>,
         blocking_mode: BlockingMode,
         blocking_ipv4: Ipv4Addr,
         blocking_ipv6: Ipv6Addr,
@@ -164,6 +168,8 @@ impl BlockAuthority {
             block_subdomains,
             allow_exact,
             allow_subdomains,
+            block_rules,
+            allow_rules,
             blocking_mode,
             blocking_ipv4,
             blocking_ipv6,
@@ -185,6 +191,43 @@ impl BlockAuthority {
                 .block_subdomains
                 .iter()
                 .any(|suffix| suffix_match(domain, suffix))
+    }
+
+    fn matches_rule_list(
+        &self,
+        rules: &[CompiledMatchRule],
+        domain: &str,
+        rtype: RecordType,
+    ) -> bool {
+        rules.iter().any(|rule| {
+            if !rule_allows_type(rule, rtype) {
+                return false;
+            }
+            if rule
+                .denyallow
+                .iter()
+                .any(|pattern| domain_pattern_matches(pattern, domain))
+            {
+                return false;
+            }
+            match &rule.matcher {
+                super::rules::Matcher::Regex(regex) => regex.is_match(domain),
+            }
+        })
+    }
+
+    fn matches_allowlist_important(&self, domain: &str, rtype: RecordType) -> bool {
+        self.allow_rules
+            .iter()
+            .filter(|rule| rule.important)
+            .any(|rule| complex_rule_matches(rule, domain, rtype))
+    }
+
+    fn matches_blocklist_important(&self, domain: &str, rtype: RecordType) -> bool {
+        self.block_rules
+            .iter()
+            .filter(|rule| rule.important)
+            .any(|rule| complex_rule_matches(rule, domain, rtype))
     }
 }
 
@@ -214,24 +257,27 @@ impl Authority for BlockAuthority {
         rtype: RecordType,
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup> {
-        use LookupControlFlow::{Break, Skip};
+        use LookupControlFlow::Skip;
 
         let domain = normalized_query_name(name);
-        if self.matches_allowlist(&domain) || !self.matches_blocklist(&domain) {
+        if self.matches_allowlist_important(&domain, rtype) {
             return Skip;
         }
 
-        match self.blocking_mode {
-            BlockingMode::Default => Break(Ok(block_lookup_records(
-                name,
-                rtype,
-                lookup_options,
-                self.blocking_ipv4,
-                self.blocking_ipv6,
-                self.ttl,
-            ))),
-            BlockingMode::Nxdomain => Break(Err(LookupError::from(ResponseCode::NXDomain))),
+        if self.matches_blocklist_important(&domain, rtype) {
+            return self.block_response(name, rtype, lookup_options);
         }
+
+        let allowed_normal = self.matches_allowlist(&domain)
+            || self.matches_rule_list(&self.allow_rules, &domain, rtype);
+        let blocked_normal = self.matches_blocklist(&domain)
+            || self.matches_rule_list(&self.block_rules, &domain, rtype);
+
+        if allowed_normal || !blocked_normal {
+            return Skip;
+        }
+
+        self.block_response(name, rtype, lookup_options)
     }
 
     async fn search(
@@ -257,6 +303,29 @@ impl Authority for BlockAuthority {
         ))))
     }
 
+}
+
+impl BlockAuthority {
+    fn block_response(
+        &self,
+        name: &LowerName,
+        rtype: RecordType,
+        lookup_options: LookupOptions,
+    ) -> LookupControlFlow<AuthLookup> {
+        use LookupControlFlow::Break;
+
+        match self.blocking_mode {
+            BlockingMode::Default => Break(Ok(block_lookup_records(
+                name,
+                rtype,
+                lookup_options,
+                self.blocking_ipv4,
+                self.blocking_ipv6,
+                self.ttl,
+            ))),
+            BlockingMode::Nxdomain => Break(Err(LookupError::from(ResponseCode::NXDomain))),
+        }
+    }
 }
 
 #[async_trait]
@@ -490,6 +559,30 @@ fn suffix_match(domain: &str, suffix: &str) -> bool {
         || domain
             .strip_suffix(suffix)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn rule_allows_type(rule: &CompiledMatchRule, rtype: RecordType) -> bool {
+    match &rule.dnstypes {
+        None => true,
+        Some(TypeConstraint::Include(types)) => types.contains(&rtype),
+        Some(TypeConstraint::Exclude(types)) => !types.contains(&rtype),
+    }
+}
+
+fn complex_rule_matches(rule: &CompiledMatchRule, domain: &str, rtype: RecordType) -> bool {
+    if !rule_allows_type(rule, rtype) {
+        return false;
+    }
+    if rule
+        .denyallow
+        .iter()
+        .any(|pattern| domain_pattern_matches(pattern, domain))
+    {
+        return false;
+    }
+    match &rule.matcher {
+        super::rules::Matcher::Regex(regex) => regex.is_match(domain),
+    }
 }
 
 #[cfg(test)]
