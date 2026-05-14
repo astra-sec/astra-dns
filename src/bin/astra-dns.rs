@@ -12,13 +12,9 @@
 //!       astra-dns (-h | --help | --version)
 //!
 //! Options:
-//!    -q, --quiet             Disable INFO messages, WARN and ERROR will remain
-//!    -d, --debug             Turn on DEBUG messages (default is only INFO)
 //!    -h, --help              Show this message
 //!    -v, --version           Show the version of hickory-dns
 //!    -c FILE, --config=FILE  Path to configuration file, default is /etc/named.yaml
-//!    -p PORT, --port=PORT    Override the listening port
-//!    --tls-port=PORT         Override the listening port for TLS connections
 //! ```
 
 #![recursion_limit = "128"]
@@ -80,14 +76,6 @@ struct Cli {
     #[clap(long = "workers")]
     workers: Option<usize>,
 
-    /// Disable INFO messages, WARN and ERROR will remain
-    #[clap(short = 'q', long = "quiet", conflicts_with = "debug")]
-    quiet: bool,
-
-    /// Turn on `DEBUG` messages (default is only `INFO`)
-    #[clap(short = 'd', long = "debug", conflicts_with = "quiet")]
-    debug: bool,
-
     /// Path to configuration file of named server
     #[clap(
         short = 'c',
@@ -98,11 +86,6 @@ struct Cli {
     )]
     config: PathBuf,
 
-    /// Listening port for DNS queries,
-    /// overrides any value in config file
-    #[clap(short = 'p', long = "port", value_name = "PORT")]
-    port: Option<u16>,
-
     /// Listening socket for Prometheus metrics,
     /// for remote access configure socket as needed (e.g. 0.0.0.0:9000)
     /// overrides any value in config file
@@ -112,16 +95,6 @@ struct Cli {
         value_name = "PROMETHEUS-LISTEN-ADDRESS"
     )]
     prometheus_listen_addr: Option<SocketAddr>,
-
-    /// Disable TCP protocol,
-    /// overrides any value in config file
-    #[clap(long = "disable-tcp")]
-    disable_tcp: bool,
-
-    /// Disable UDP protocol,
-    /// overrides any value in config file
-    #[clap(long = "disable-udp")]
-    disable_udp: bool,
 
     /// Disable Prometheus metrics,
     /// overrides any value in config file
@@ -145,19 +118,12 @@ fn main() -> Result<(), String> {
 fn run() -> Result<(), String> {
     let args = Cli::parse();
 
-    // TODO: this should be set after loading config, but it's necessary for initial log lines, no?
-    let level = match (args.quiet, args.debug) {
-        (true, _) => Level::ERROR,
-        (_, true) => Level::DEBUG,
-        _ => Level::INFO,
-    };
-
     // Setup tracing for logging based on input
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().event_format(TdnsFormatter))
         .with(
             EnvFilter::builder()
-                .with_default_directive(level.into())
+                .with_default_directive(Level::INFO.into())
                 .from_env()
                 .map_err(|err| {
                     format!("failed to parse environment variable for tracing: {err}")
@@ -257,7 +223,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
     let handler = ReloadableCatalog::new(loaded.catalog.clone());
     let mut server = ServerFuture::new(handler.clone());
 
-    if !args.disable_udp && !config.disable_udp() {
+    if !config.disable_udp() {
         // load all udp listeners
         for addr in &listen_addrs {
             info!("binding UDP to {addr:?}");
@@ -278,7 +244,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
         info!("UDP protocol is disabled");
     }
 
-    if !args.disable_tcp && !config.disable_tcp() {
+    if !config.disable_tcp() {
         // load all tcp listeners
         for addr in &listen_addrs {
             info!("binding TCP to {addr:?}");
@@ -299,12 +265,18 @@ async fn async_run(args: Cli) -> Result<(), String> {
         info!("TCP protocol is disabled");
     }
 
-    // Drop privileges on Unix systems if running as root.
+    // Drop privileges on Unix systems only when both user and group are explicitly configured.
     #[cfg(target_family = "unix")]
-    check_drop_privs(
-        config.user.as_deref().unwrap_or(DEFAULT_USER),
-        config.group.as_deref().unwrap_or(DEFAULT_GROUP),
-    )?;
+    match (config.user.as_deref(), config.group.as_deref()) {
+        (Some(user), Some(group)) => check_drop_privs(user, group)?,
+        (None, None) => info!("running with current process user/group"),
+        _ => {
+            return Err(
+                "both 'user' and 'group' must be set together when requesting privilege drop"
+                    .to_string(),
+            )
+        }
+    }
     #[cfg(not(target_family = "unix"))]
     if config.user.is_some() || config.group.is_some() {
         return Err("dropping privileges is only supported on Unix systems".to_string());
@@ -515,9 +487,9 @@ impl ReloadSettings {
 
         Ok(Self {
             listen_addrs,
-            listen_port: args.port.unwrap_or_else(|| config.listen_port()),
-            udp_enabled: !args.disable_udp && !config.disable_udp(),
-            tcp_enabled: !args.disable_tcp && !config.disable_tcp(),
+            listen_port: config.listen_port(),
+            udp_enabled: !config.disable_udp(),
+            tcp_enabled: !config.disable_tcp(),
             tcp_request_timeout_secs: config.tcp_request_timeout().as_secs(),
             user: config.user.clone(),
             group: config.group.clone(),
@@ -806,8 +778,3 @@ fn check_drop_privs(user: &str, group: &str) -> Result<(), String> {
     info!("now running as uid: {uid}, gid: {gid} (euid: {euid}, egid: {egid})",);
     Ok(())
 }
-
-#[cfg(target_family = "unix")]
-static DEFAULT_USER: &str = "nobody";
-#[cfg(target_family = "unix")]
-static DEFAULT_GROUP: &str = "nobody";

@@ -74,13 +74,13 @@ pub struct Config {
     log_level: Option<String>,
     /// User to run the server as.
     ///
-    /// Only supported on Unix-like platforms. If the real or effective UID of the hickory process
-    /// is root, we will attempt to change to this user (or to nobody if no user is specified here.)
+    /// Only supported on Unix-like platforms. When both user and group are set, the server will
+    /// attempt to switch to them after binding sockets.
     pub user: Option<String>,
     /// Group to run the server as.
     ///
-    /// Only supported on Unix-like platforms. If the real or effective UID of the hickory process
-    /// is root, we will attempt to change to this group (or to nobody if no group is specified here.)
+    /// Only supported on Unix-like platforms. When both user and group are set, the server will
+    /// attempt to switch to them after binding sockets.
     pub group: Option<String>,
     /// List of configurations for zones
     #[serde(default)]
