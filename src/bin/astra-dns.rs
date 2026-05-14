@@ -5,11 +5,11 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-//! The `hickory-dns` binary for running a DNS server
+//! The `astra-dns` binary for running a DNS server
 //!
 //! ```text
-//! Usage: hickory-dns [options]
-//!       hickory-dns (-h | --help | --version)
+//! Usage: astra-dns [options]
+//!       astra-dns (-h | --help | --version)
 //!
 //! Options:
 //!    -q, --quiet             Disable INFO messages, WARN and ERROR will remain
@@ -56,16 +56,16 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use dns_server::{CompiledRuleSets, Config};
+use astra_dns::{CompiledRuleSets, Config};
 #[cfg(feature = "prometheus-metrics")]
-use dns_server::PrometheusServer;
+use astra_dns::PrometheusServer;
 #[cfg(feature = "metrics")]
-use dns_server::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
+use astra_dns::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{authority::Catalog, server::ServerFuture};
 
 /// Cli struct for all options managed with clap derive api.
 #[derive(Debug, Parser)]
-#[clap(name = "Hickory DNS named server", version, about)]
+#[clap(name = "astra-dns", version, about)]
 struct Cli {
     /// Test validation of configuration files
     #[clap(long = "validate")]

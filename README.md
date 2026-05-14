@@ -1,6 +1,6 @@
-# dns-server
+# astra-dns
 
-`dns-server` is a Rust DNS server built on top of Hickory DNS.
+`astra-dns` is a Rust DNS server built on top of Hickory DNS.
 
 The project started as a small Hickory-based DNS wrapper with custom YAML
 configuration. It now focuses on a router-friendly forwarding and filtering
@@ -47,7 +47,7 @@ If ad-blocking config is added, the server can also:
 
 The main runtime is still Hickory-based:
 
-- [src/bin/dns-server.rs](./src/bin/dns-server.rs): CLI entrypoint, Tokio
+- [src/bin/astra-dns.rs](./src/bin/astra-dns.rs): CLI entrypoint, Tokio
   runtime, config loading, server startup
 - [src/lib.rs](./src/lib.rs): config schema and zone/store loading
 
@@ -195,7 +195,7 @@ Build and run:
 
 ```bash
 cargo build
-./target/debug/dns-server -c named.yaml
+./target/debug/astra-dns -c named.yaml
 ```
 
 Or use:
@@ -207,7 +207,7 @@ Or use:
 Validate config only:
 
 ```bash
-./target/debug/dns-server --validate -c named.yaml
+./target/debug/astra-dns --validate -c named.yaml
 ```
 
 Query the server:
