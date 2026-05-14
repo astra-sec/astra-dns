@@ -1,18 +1,19 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
     str::FromStr,
 };
 
+use hickory_proto::rr::RecordType;
 use ipnet::IpNet;
 use regex::Regex;
 use tracing::warn;
-use hickory_proto::rr::RecordType;
 
 use super::{
     BlockingMode, FilterConfig, FilteringConfig,
     config::RewriteConfig,
-    fetch::fetch_filter,
+    fetch::{FilterFetchOptions, fetch_filter},
 };
 
 #[derive(Clone, Debug)]
@@ -114,13 +115,25 @@ enum RuleOrigin {
 }
 
 impl CompiledRuleSets {
-    pub async fn build(config: AdblockRuntimeConfig) -> Result<Self, String> {
+    pub async fn build(config: AdblockRuntimeConfig, config_path: &Path) -> Result<Self, String> {
         let mut rules = RuleSets::default();
         let mut disabled_rules = HashSet::new();
+        let fetch_options = FilterFetchOptions::for_config_path(config_path);
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
-            let contents = fetch_filter(filter).await?;
-            parse_rule_lines(&contents, RuleOrigin::RemoteFilter, &mut rules, &mut disabled_rules)?;
+            let contents = match fetch_filter(filter, &fetch_options).await {
+                Ok(contents) => contents,
+                Err(err) => {
+                    warn!("{err}");
+                    continue;
+                }
+            };
+            parse_rule_lines(
+                &contents,
+                RuleOrigin::RemoteFilter,
+                &mut rules,
+                &mut disabled_rules,
+            )?;
         }
 
         for line in &config.user_rules {
@@ -171,7 +184,8 @@ fn parse_rule_line(
         return Ok(());
     }
 
-    if let Some((disposition, domain, include_subdomains)) = parse_simple_adblock_domain_rule(line) {
+    if let Some((disposition, domain, include_subdomains)) = parse_simple_adblock_domain_rule(line)
+    {
         add_domain_rule(disposition, &domain, include_subdomains, rules);
         return Ok(());
     }
@@ -353,15 +367,16 @@ fn parse_dnstype_modifier(value: &str) -> Result<TypeConstraint, String> {
     let exclude = values.iter().all(|v| v.starts_with('~'));
     let include = values.iter().all(|v| !v.starts_with('~'));
     if !exclude && !include {
-        return Err(format!("mixed include/exclude dnstype modifier is unsupported: {value}"));
+        return Err(format!(
+            "mixed include/exclude dnstype modifier is unsupported: {value}"
+        ));
     }
 
     let mut types = HashSet::new();
     for value in values {
         let value = value.trim_start_matches('~').to_ascii_uppercase();
         types.insert(
-            RecordType::from_str(&value)
-                .map_err(|_| format!("invalid dnstype value: {value}"))?,
+            RecordType::from_str(&value).map_err(|_| format!("invalid dnstype value: {value}"))?,
         );
     }
 
@@ -540,7 +555,11 @@ fn remove_domain_rule(
 }
 
 fn is_allowed(domain: &str, rules: &RuleSets) -> bool {
-    rules.allow_exact.contains(domain) || rules.allow_subdomains.iter().any(|suffix| suffix_match(domain, suffix))
+    rules.allow_exact.contains(domain)
+        || rules
+            .allow_subdomains
+            .iter()
+            .any(|suffix| suffix_match(domain, suffix))
 }
 
 fn suffix_match(domain: &str, suffix: &str) -> bool {
@@ -642,9 +661,7 @@ fn parse_domain_pattern(value: &str) -> Result<DomainPattern, String> {
 pub fn domain_pattern_matches(pattern: &DomainPattern, domain: &str) -> bool {
     match pattern {
         DomainPattern::Exact(exact) => domain == exact,
-        DomainPattern::WildcardSuffix(suffix) => {
-            domain != suffix && suffix_match(domain, suffix)
-        }
+        DomainPattern::WildcardSuffix(suffix) => domain != suffix && suffix_match(domain, suffix),
     }
 }
 
@@ -657,9 +674,27 @@ mod tests {
         let mut rules = RuleSets::default();
         let mut disabled = HashSet::new();
 
-        parse_rule_line("||ads.example.com^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
-        parse_rule_line("@@||good.example.com^", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
-        parse_rule_line("1.2.3.4 internal.example.com", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
+        parse_rule_line(
+            "||ads.example.com^",
+            RuleOrigin::RemoteFilter,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
+        parse_rule_line(
+            "@@||good.example.com^",
+            RuleOrigin::UserRule,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
+        parse_rule_line(
+            "1.2.3.4 internal.example.com",
+            RuleOrigin::UserRule,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
 
         assert!(rules.block_exact.contains("ads.example.com"));
         assert!(rules.block_subdomains.contains("ads.example.com"));
@@ -680,8 +715,20 @@ mod tests {
         let mut rules = RuleSets::default();
         let mut disabled = HashSet::new();
 
-        parse_rule_line("@@||video.example.com^", RuleOrigin::UserRule, &mut rules, &mut disabled).unwrap();
-        parse_rule_line("||video.example.com^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
+        parse_rule_line(
+            "@@||video.example.com^",
+            RuleOrigin::UserRule,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
+        parse_rule_line(
+            "||video.example.com^",
+            RuleOrigin::RemoteFilter,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
 
         assert!(!rules.block_exact.contains("video.example.com"));
         assert!(rules.allow_subdomains.contains("video.example.com"));
@@ -735,9 +782,20 @@ mod tests {
         let mut rules = RuleSets::default();
         let mut disabled = HashSet::new();
 
-        parse_rule_line("||pl.ua^", RuleOrigin::RemoteFilter, &mut rules, &mut disabled).unwrap();
-        parse_rule_line("||pl.ua^$badfilter", RuleOrigin::RemoteFilter, &mut rules, &mut disabled)
-            .unwrap();
+        parse_rule_line(
+            "||pl.ua^",
+            RuleOrigin::RemoteFilter,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
+        parse_rule_line(
+            "||pl.ua^$badfilter",
+            RuleOrigin::RemoteFilter,
+            &mut rules,
+            &mut disabled,
+        )
+        .unwrap();
         apply_badfilters(&mut rules, &disabled);
 
         assert!(!rules.block_subdomains.contains("pl.ua"));

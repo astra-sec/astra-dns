@@ -58,9 +58,9 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use astra_dns::{CompiledRuleSets, Config};
 #[cfg(feature = "prometheus-metrics")]
 use astra_dns::PrometheusServer;
+use astra_dns::{CompiledRuleSets, Config};
 #[cfg(feature = "metrics")]
 use astra_dns::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{
@@ -234,8 +234,8 @@ async fn async_run(args: Cli) -> Result<(), String> {
     let mut terminate_signal = signal(SignalKind::terminate())
         .map_err(|e| format!("failed to register signal handler: {e}"))?;
     #[cfg(unix)]
-    let mut reload_signal =
-        signal(SignalKind::hangup()).map_err(|e| format!("failed to register signal handler: {e}"))?;
+    let mut reload_signal = signal(SignalKind::hangup())
+        .map_err(|e| format!("failed to register signal handler: {e}"))?;
 
     let runtime_handles = RuntimeHandles {
         #[cfg(feature = "prometheus-metrics")]
@@ -356,8 +356,7 @@ async fn async_run(args: Cli) -> Result<(), String> {
 
 async fn finish_server_run(
     result: Result<(), hickory_proto::ProtoError>,
-    #[allow(unused_variables)]
-    runtime_handles: RuntimeHandles,
+    #[allow(unused_variables)] runtime_handles: RuntimeHandles,
 ) -> Result<(), String> {
     match result {
         Ok(()) => info!("Hickory DNS {} stopping", hickory_client::version()),
@@ -402,7 +401,7 @@ async fn load_runtime_config(config_path: &std::path::Path) -> Result<LoadedRunt
 
 async fn build_catalog(config_path: &std::path::Path, config: &Config) -> Result<Catalog, String> {
     let adblock_rules = match config.adblock_runtime_config() {
-        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config).await?),
+        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config, config_path).await?),
         None => None,
     };
 
