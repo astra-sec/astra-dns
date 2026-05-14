@@ -210,6 +210,25 @@ Validate config only:
 ./target/debug/astra-dns --validate -c named.yaml
 ```
 
+Reload configuration after editing the YAML:
+
+```bash
+kill -HUP "$(pidof astra-dns)"
+```
+
+Current hot reload support is limited to resolver and filtering changes such as:
+
+- `dns.upstream_dns`
+- `filters`
+- `user_rules`
+- `filtering.blocking_mode`
+- `filtering.blocking_ipv4`
+- `filtering.blocking_ipv6`
+- `filtering.rewrites`
+
+Changes to listener or process-level settings such as listen addresses, port,
+TCP or UDP enablement, timeout, user, or group still require a full restart.
+
 Query the server:
 
 ```bash

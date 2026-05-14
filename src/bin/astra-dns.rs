@@ -30,8 +30,10 @@ use std::{
     io::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
+    sync::{Arc, RwLock},
 };
 
+use async_trait::async_trait;
 use clap::Parser;
 #[cfg(feature = "metrics")]
 use metrics::{Counter, Unit, counter, describe_counter, describe_gauge, gauge};
@@ -61,7 +63,10 @@ use astra_dns::{CompiledRuleSets, Config};
 use astra_dns::PrometheusServer;
 #[cfg(feature = "metrics")]
 use astra_dns::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
-use hickory_server::{authority::Catalog, server::ServerFuture};
+use hickory_server::{
+    authority::Catalog,
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture},
+};
 
 /// Cli struct for all options managed with clap derive api.
 #[derive(Debug, Parser)]
@@ -182,14 +187,11 @@ async fn async_run(args: Cli) -> Result<(), String> {
 
     info!("loading configuration from: {config_path:?}");
 
-    let config = Config::read_config(config_path)
-        .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
-    let adblock_rules = match config.adblock_runtime_config() {
-        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config).await?),
-        None => None,
-    };
+    let loaded = load_runtime_config(config_path).await?;
+    let config = loaded.config;
+    let mut reload_settings = ReloadSettings::from_effective_config(&args, &config, config_path)?;
     #[cfg(feature = "prometheus-metrics")]
-    let prometheus_server_opt = if !args.disable_prometheus && !config.disable_prometheus() {
+    let prometheus_server = if !args.disable_prometheus && !config.disable_prometheus() {
         let socket_addr = args
             .prometheus_listen_addr
             .unwrap_or(config.prometheus_listen_addr());
@@ -229,53 +231,31 @@ async fn async_run(args: Cli) -> Result<(), String> {
     };
 
     #[cfg(unix)]
-    let mut signal = signal(SignalKind::terminate())
+    let mut terminate_signal = signal(SignalKind::terminate())
         .map_err(|e| format!("failed to register signal handler: {e}"))?;
+    #[cfg(unix)]
+    let mut reload_signal =
+        signal(SignalKind::hangup()).map_err(|e| format!("failed to register signal handler: {e}"))?;
 
-    let mut catalog: Catalog = Catalog::new();
-    // configure our server based on the config_path
-    for zone in config.zones() {
-        let zone_name = zone
-            .zone()
-            .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
-
-        match zone.load(adblock_rules.as_ref()).await {
-            Ok(authority) => catalog.upsert(zone_name.into(), authority),
-            Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
-        }
-
+    let runtime_handles = RuntimeHandles {
+        #[cfg(feature = "prometheus-metrics")]
+        prometheus_server,
         #[cfg(feature = "metrics")]
-        config_metrics.increment_zone_metrics(zone);
-    }
-
-    let v4addr = config
-        .listen_addrs_ipv4()
-        .map_err(|err| format!("failed to parse IPv4 addresses from {config_path:?}: {err}"))?;
-    let v6addr = config
-        .listen_addrs_ipv6()
-        .map_err(|err| format!("failed to parse IPv6 addresses from {config_path:?}: {err}"))?;
-    let mut listen_addrs: Vec<IpAddr> = v4addr
-        .into_iter()
-        .map(IpAddr::V4)
-        .chain(v6addr.into_iter().map(IpAddr::V6))
-        .collect();
-
-    let listen_port: u16 = args.port.unwrap_or_else(|| config.listen_port());
-
-    if listen_addrs.is_empty() {
-        listen_addrs.push(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        listen_addrs.push(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-    }
+        process_metrics_collector,
+    };
 
     if args.validate {
         info!("configuration files are validated");
         return Ok(());
     }
 
+    let listen_addrs = reload_settings.listen_addrs.clone();
+    let listen_port = reload_settings.listen_port;
     let tcp_request_timeout = config.tcp_request_timeout();
 
     // now, run the server, based on the config
-    let mut server = ServerFuture::new(catalog);
+    let handler = ReloadableCatalog::new(loaded.catalog.clone());
+    let mut server = ServerFuture::new(handler.clone());
 
     if !args.disable_udp && !config.disable_udp() {
         // load all udp listeners
@@ -332,47 +312,253 @@ async fn async_run(args: Cli) -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        let token = server.shutdown_token().clone();
-        tokio::spawn(async move {
-            signal.recv().await;
-            token.cancel();
-        });
+        let shutdown_token = server.shutdown_token().clone();
+        let mut server_task = tokio::spawn(async move { server.block_until_done().await });
+
+        banner();
+        info!("server starting up, awaiting connections...");
+
+        loop {
+            tokio::select! {
+                _ = terminate_signal.recv() => {
+                    info!("termination signal received, shutting down");
+                    shutdown_token.cancel();
+                    break;
+                }
+                _ = reload_signal.recv() => {
+                    match reload_runtime_config(config_path, &args, &handler, &mut reload_settings).await {
+                        Ok(()) => info!("configuration reload completed"),
+                        Err(err) => error!("configuration reload failed: {err}"),
+                    }
+                }
+                result = &mut server_task => {
+                    let result = result.map_err(|err| format!("server task failed: {err}"))?;
+                    return finish_server_run(result, runtime_handles).await;
+                }
+            }
+        }
+
+        let result = server_task
+            .await
+            .map_err(|err| format!("server task failed: {err}"))?;
+        return finish_server_run(result, runtime_handles).await;
     }
 
-    // config complete, starting!
+    #[cfg(not(unix))]
     banner();
-
-    // TODO: how to do threads? should we do a bunch of listener threads and then query threads?
-    // Ideally the processing would be n-threads for receiving, which hand off to m-threads for
-    //  request handling. It would generally be the case that n <= m.
+    #[cfg(not(unix))]
     info!("server starting up, awaiting connections...");
-    match server.block_until_done().await {
-        Ok(()) => {
-            // we're exiting for some reason...
-            info!("Hickory DNS {} stopping", hickory_client::version());
-        }
+    #[cfg(not(unix))]
+    let result = server.block_until_done().await;
+    #[cfg(not(unix))]
+    finish_server_run(result, runtime_handles).await
+}
+
+async fn finish_server_run(
+    result: Result<(), hickory_proto::ProtoError>,
+    #[allow(unused_variables)]
+    runtime_handles: RuntimeHandles,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => info!("Hickory DNS {} stopping", hickory_client::version()),
         Err(e) => {
             let error_msg = format!(
                 "Hickory DNS {} has encountered an error: {}",
                 hickory_client::version(),
                 e
             );
-
-            error!("{}", error_msg);
-            panic!("{}", error_msg);
+            error!("{error_msg}");
+            return Err(error_msg);
         }
-    };
+    }
 
-    // Shut down the Prometheus metrics server after the DNS server has gracefully shut down.
     #[cfg(feature = "prometheus-metrics")]
-    if let Some(server) = prometheus_server_opt {
+    if let Some(server) = runtime_handles.prometheus_server {
         server.stop().await;
     }
 
     #[cfg(feature = "metrics")]
-    process_metrics_collector.abort();
+    runtime_handles.process_metrics_collector.abort();
 
     Ok(())
+}
+
+struct RuntimeHandles {
+    #[cfg(feature = "prometheus-metrics")]
+    prometheus_server: Option<PrometheusServer>,
+    #[cfg(feature = "metrics")]
+    process_metrics_collector: tokio::task::JoinHandle<()>,
+}
+
+async fn load_runtime_config(config_path: &std::path::Path) -> Result<LoadedRuntimeConfig, String> {
+    let config = Config::read_config(config_path)
+        .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
+    let catalog = build_catalog(config_path, &config).await?;
+    Ok(LoadedRuntimeConfig {
+        config,
+        catalog: Arc::new(catalog),
+    })
+}
+
+async fn build_catalog(config_path: &std::path::Path, config: &Config) -> Result<Catalog, String> {
+    let adblock_rules = match config.adblock_runtime_config() {
+        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config).await?),
+        None => None,
+    };
+
+    let mut catalog = Catalog::new();
+    for zone in config.zones() {
+        let zone_name = zone
+            .zone()
+            .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
+
+        match zone.load(adblock_rules.as_ref()).await {
+            Ok(authority) => catalog.upsert(zone_name.into(), authority),
+            Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
+        }
+    }
+
+    Ok(catalog)
+}
+
+async fn reload_runtime_config(
+    config_path: &std::path::Path,
+    args: &Cli,
+    handler: &ReloadableCatalog,
+    active_settings: &mut ReloadSettings,
+) -> Result<(), String> {
+    info!("reloading configuration from {config_path:?}");
+
+    let loaded = load_runtime_config(config_path).await?;
+    let new_settings = ReloadSettings::from_effective_config(args, &loaded.config, config_path)?;
+    active_settings.ensure_reload_safe(&new_settings)?;
+    handler.replace(loaded.catalog);
+    *active_settings = new_settings;
+
+    Ok(())
+}
+
+struct LoadedRuntimeConfig {
+    config: Config,
+    catalog: Arc<Catalog>,
+}
+
+#[derive(Clone)]
+struct ReloadableCatalog {
+    current: Arc<RwLock<Arc<Catalog>>>,
+}
+
+impl ReloadableCatalog {
+    fn new(initial: Arc<Catalog>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    fn replace(&self, catalog: Arc<Catalog>) {
+        *self
+            .current
+            .write()
+            .expect("reloadable catalog lock poisoned") = catalog;
+    }
+}
+
+#[async_trait]
+impl RequestHandler for ReloadableCatalog {
+    async fn handle_request<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+    ) -> ResponseInfo {
+        let catalog = self
+            .current
+            .read()
+            .expect("reloadable catalog lock poisoned")
+            .clone();
+        catalog.handle_request(request, response_handle).await
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReloadSettings {
+    listen_addrs: Vec<IpAddr>,
+    listen_port: u16,
+    udp_enabled: bool,
+    tcp_enabled: bool,
+    tcp_request_timeout_secs: u64,
+    user: Option<String>,
+    group: Option<String>,
+}
+
+impl ReloadSettings {
+    fn from_effective_config(
+        args: &Cli,
+        config: &Config,
+        config_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        let v4addr = config
+            .listen_addrs_ipv4()
+            .map_err(|err| format!("failed to parse IPv4 addresses from {config_path:?}: {err}"))?;
+        let v6addr = config
+            .listen_addrs_ipv6()
+            .map_err(|err| format!("failed to parse IPv6 addresses from {config_path:?}: {err}"))?;
+
+        let mut listen_addrs: Vec<IpAddr> = v4addr
+            .into_iter()
+            .map(IpAddr::V4)
+            .chain(v6addr.into_iter().map(IpAddr::V6))
+            .collect();
+        if listen_addrs.is_empty() {
+            listen_addrs.push(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            listen_addrs.push(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        }
+        listen_addrs.sort();
+
+        Ok(Self {
+            listen_addrs,
+            listen_port: args.port.unwrap_or_else(|| config.listen_port()),
+            udp_enabled: !args.disable_udp && !config.disable_udp(),
+            tcp_enabled: !args.disable_tcp && !config.disable_tcp(),
+            tcp_request_timeout_secs: config.tcp_request_timeout().as_secs(),
+            user: config.user.clone(),
+            group: config.group.clone(),
+        })
+    }
+
+    fn ensure_reload_safe(&self, new: &Self) -> Result<(), String> {
+        let mut changed = Vec::new();
+
+        if self.listen_addrs != new.listen_addrs {
+            changed.push("listen addresses");
+        }
+        if self.listen_port != new.listen_port {
+            changed.push("listen port");
+        }
+        if self.udp_enabled != new.udp_enabled {
+            changed.push("UDP enable/disable state");
+        }
+        if self.tcp_enabled != new.tcp_enabled {
+            changed.push("TCP enable/disable state");
+        }
+        if self.tcp_request_timeout_secs != new.tcp_request_timeout_secs {
+            changed.push("TCP request timeout");
+        }
+        if self.user != new.user {
+            changed.push("user");
+        }
+        if self.group != new.group {
+            changed.push("group");
+        }
+
+        if changed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "hot reload only supports resolver and filtering changes; restart required because these settings changed: {}",
+                changed.join(", ")
+            ))
+        }
+    }
 }
 
 fn banner() {
