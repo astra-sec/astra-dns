@@ -17,9 +17,7 @@ use hickory_server::{
 pub use config::{BlockingMode, FilterConfig, FilteringConfig};
 pub use rules::{AdblockRuntimeConfig, CompiledRuleSets};
 
-use self::{
-    authority::{BlockAuthority, OverrideAuthority, RewriteAuthority},
-};
+use self::authority::{BlockAuthority, OverrideAuthority, RewriteAuthority};
 
 pub fn build_authorities(
     origin: Name,

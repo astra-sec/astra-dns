@@ -1,6 +1,6 @@
-# 基本配置
+# Basic configuration
 listen_addrs_ipv4: ["0.0.0.0"]
-listen_port: 8053
+listen_port: 5553
 
 filters:
   - enabled: false
@@ -21,94 +21,34 @@ filters:
     id: 1741278925
 
 user_rules:
-  - '# 自定义'
-  - '# 127.0.0.1 pic1.zhimg.com'
-  - '# 127.0.0.1 pic2.zhimg.com'
-  - '# 127.0.0.1 pic3.zhimg.com'
-  - '# 127.0.0.1 pic4.zhimg.com'
-  - 127.0.0.1 g20.alicdn.com
-  - 127.0.0.1 tanximg.alicdn.com
-  - 127.0.0.1 lpfm2-public.myzhiniu.com
-  - 127.0.0.1 himg.baidu.com
-  - '# 屏蔽小米电视投屏广告'
-  - 127.0.0.1 fix.hpplay.cn
-  - 127.0.0.1 rps.hpplay.cn
-  - 127.0.0.1 imdns.hpplay.cn
-  - 127.0.0.1 devicemgr.hpplay.cn
-  - 127.0.0.1 rp.hpplay.cn
-  - 127.0.0.1 tvapp.hpplay.cn
-  - 127.0.0.1 pin.hpplay.cn
-  - 127.0.0.1 adcdn.hpplay.cn
-  - 127.0.0.1 sl.hpplay.cn
-  - 127.0.0.1 vipauth.hpplay.cn
-  - 127.0.0.1 vipsdkauth.hpplay.cn
-  - 127.0.0.1 sdkauth.hpplay.cn
-  - 127.0.0.1 adeng.hpplay.cn
-  - 127.0.0.1 conf.hpplay.cn
-  - 127.0.0.1 image.hpplay.cn
-  - 127.0.0.1 hotupgrade.hpplay.cn
-  - 127.0.0.1 cloud.hpplay.cn
-  - 127.0.0.1 ad.hpplay.cn
-  - 127.0.0.1 adc.hpplay.cn
-  - 127.0.0.1 gslb.hpplay.cn
-  - 127.0.0.1 cdn1.hpplay.cn
-  - 127.0.0.1 ftp.hpplay.com.cn
-  - 127.0.0.1 rp.hpplay.com.cn
-  - 127.0.0.1 cdn.hpplay.com.cn
-  - 127.0.0.1 userapi.hpplay.com.cn
-  - 127.0.0.1 leboapi.hpplay.com.cn
-  - 127.0.0.1 api.hpplay.com.cn
-  - 127.0.0.1 h5.hpplay.com.cn
-  - 127.0.0.1 hpplay.cdn.cibn.cc
-  - '# 屏蔽小米电视其他广告'
-  - 127.0.0.1 t7z.cupid.ptqy.gitv.tv
-  - 127.0.0.1 logonext.tv.kuyun.com
-  - 127.0.0.1 config.kuyun.com
-  - 127.0.0.1 f5.market.xiaomi.com
-  - 127.0.0.1 f4.market.xiaomi.com
-  - 127.0.0.1 f3.market.xiaomi.com
-  - 127.0.0.1 f2.market.xiaomi.com
-  - 127.0.0.1 f1.market.xiaomi.com
-  - 127.0.0.1 api.ad.xiaomi.com
-  - 127.0.0.1 ad.xiaomi.com
-  - 127.0.0.1 ad1.xiaomi.com
-  - 127.0.0.1 video.market.xiaomi.com
-  - 127.0.0.1 ad.mi.com
-  - 127.0.0.1 f5.market.mi-img.com
-  - 127.0.0.1 f4.market.mi-img.com
-  - 127.0.0.1 f3.market.mi-img.com
-  - 127.0.0.1 f2.market.mi-img.com
-  - 127.0.0.1 f1.market.mi-img.com
 
 filtering:
-  # blocking_ipv4: ""
-  # blocking_ipv6: ""
-  # blocking_mode: default
+  blocking_mode: default
+  blocking_ipv4: 0.0.0.0
+  blocking_ipv6: "::"
   rewrites:
-    - domain: time.facebook.com
-      answer: 120.25.115.20
-    - domain: '*.vrdesktop.net'
-      answer: 0.0.0.0
-    - domain: its.pkupi.com
-      answer: 198.41.198.152
-    - domain: portal.pkupi.com
-      answer: 198.41.198.152
-    - domain: its.pkupi.com
-      answer: 104.27.105.80
-    - domain: portal.pkupi.com
-      answer: 104.27.105.80
     - ip:
-      - "1.1.1.0/24"
-      - "1.0.0.0/24"
+      - "173.245.48.0/20"
+      - "103.21.244.0/22"
+      - "103.22.200.0/22"
+      - "103.31.4.0/22"
+      - "141.101.64.0/18"
+      - "108.162.192.0/18"
+      - "190.93.240.0/20"
+      - "188.114.96.0/20"
+      - "197.234.240.0/22"
+      - "198.41.128.0/17"
       - "162.158.0.0/15"
-      - "104.16.0.0/12"
+      - "104.16.0.0/13"
+      - "104.24.0.0/14"
       - "172.64.0.0/13"
-      answer: 127.0.0.1
+      - "131.0.72.0/22"
+      answer: 104.18.192.16
     - cname:
       - "domain:cdn.cloudflare.net"
-      answer: 127.0.0.1
+      answer: 104.18.192.16
 
-# 全局转发配置 - 将所有查询转发到上游
 dns:
   upstream_dns:
-    - 8.8.8.8:53
+    - 8.8.8.8
+    - 8.8.4.4

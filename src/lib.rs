@@ -22,16 +22,18 @@ use serde::{self, Deserialize, Deserializer};
 
 use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
 use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup};
+use hickory_server::authority::{AuthorityObject, ZoneType};
 use hickory_server::store::forwarder::ForwardAuthority;
 use hickory_server::store::forwarder::ForwardConfig;
-use hickory_server::authority::{AuthorityObject, ZoneType};
 use tracing::{debug, info, warn};
 
 mod adblock;
 #[cfg(feature = "prometheus-metrics")]
 mod prometheus_server;
 
-pub use adblock::{AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterConfig, FilteringConfig};
+pub use adblock::{
+    AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterConfig, FilteringConfig,
+};
 #[cfg(feature = "prometheus-metrics")]
 pub use prometheus_server::PrometheusServer;
 
@@ -506,7 +508,10 @@ dns:
             ZoneTypeConfig::External { stores } => match &stores[0] {
                 #[cfg(feature = "resolver")]
                 ExternalStoreConfig::Forward(config) => {
-                    assert_eq!(config.name_servers[0].socket_addr, "8.8.8.8:53".parse().unwrap());
+                    assert_eq!(
+                        config.name_servers[0].socket_addr,
+                        "8.8.8.8:53".parse().unwrap()
+                    );
                 }
                 _ => panic!("expected a forward store"),
             },

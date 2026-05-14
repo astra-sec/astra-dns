@@ -7,13 +7,13 @@ use std::{
 
 use async_trait::async_trait;
 use hickory_proto::rr::{
-    LowerName, Name, RData, Record, RecordType, RecordSet,
+    LowerName, Name, RData, Record, RecordSet, RecordType,
     rdata::{A, AAAA, CNAME},
 };
 use hickory_server::{
     authority::{
-        AuthLookup, Authority, LookupControlFlow, LookupError, LookupOptions, LookupRecords,
-        LookupObject, MessageRequest, UpdateResult, ZoneType,
+        AuthLookup, Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions,
+        LookupRecords, MessageRequest, UpdateResult, ZoneType,
     },
     proto::op::ResponseCode,
     server::RequestInfo,
@@ -22,8 +22,8 @@ use hickory_server::{
 use super::{
     BlockingMode,
     rules::{
-        AnswerIpRewriteRule, CnameRewriteRule, CompiledMatchRule, DomainRewriteRule,
-        OverrideRule, TypeConstraint, domain_pattern_matches,
+        AnswerIpRewriteRule, CnameRewriteRule, CompiledMatchRule, DomainRewriteRule, OverrideRule,
+        TypeConstraint, domain_pattern_matches,
     },
 };
 
@@ -107,7 +107,6 @@ impl Authority for OverrideAuthority {
             "Getting NSEC records is unimplemented for overrides",
         ))))
     }
-
 }
 
 pub struct BlockAuthority {
@@ -302,7 +301,6 @@ impl Authority for BlockAuthority {
             "Getting NSEC records is unimplemented for the blocklist",
         ))))
     }
-
 }
 
 impl BlockAuthority {
@@ -544,12 +542,9 @@ fn record_ip(record: &Record) -> Option<IpAddr> {
 
 fn record_cname(record: &Record) -> Option<String> {
     match record.data() {
-        RData::CNAME(CNAME(target)) => Some(
-            target
-                .to_ascii()
-                .trim_end_matches('.')
-                .to_ascii_lowercase(),
-        ),
+        RData::CNAME(CNAME(target)) => {
+            Some(target.to_ascii().trim_end_matches('.').to_ascii_lowercase())
+        }
         _ => None,
     }
 }
@@ -603,6 +598,9 @@ mod tests {
             60,
             RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
         );
-        assert_eq!(record_ip(&record), Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert_eq!(
+            record_ip(&record),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
     }
 }
