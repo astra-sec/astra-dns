@@ -7,13 +7,11 @@
 
 //! Configuration module for the server binary, `named`.
 
-#[cfg(feature = "prometheus-metrics")]
-use std::net::SocketAddr;
 use std::{
     fmt,
     fs::File,
     io::Read,
-    net::{AddrParseError, Ipv4Addr, Ipv6Addr},
+    net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -24,7 +22,9 @@ use ipnet::IpNet;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
-use hickory_proto::{ProtoError, rr::Name};
+use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
+#[cfg(feature = "resolver")]
+use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup};
 #[cfg(feature = "blocklist")]
 use hickory_server::store::blocklist::BlocklistAuthority;
 #[cfg(feature = "blocklist")]
@@ -99,6 +99,9 @@ pub struct Config {
     /// List of configurations for zones
     #[serde(default)]
     zones: Vec<ZoneConfig>,
+    /// Optional AdGuard-style DNS section for simple upstream forwarding setups
+    #[serde(default)]
+    dns: Option<DnsConfig>,
     /// Remote filter lists inspired by AdGuard Home's `filters`
     #[serde(default)]
     filters: Vec<FilterConfig>,
@@ -127,7 +130,10 @@ impl Config {
 
     /// Read a [`Config`] from the given YAML string.
     pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        Ok(serde_yaml::from_str(yaml)?)
+        let config: Self = serde_yaml::from_str(yaml)?;
+        config
+            .normalize()
+            .map_err(<serde_yaml::Error as serde::de::Error>::custom)
     }
 
     /// set of listening ipv4 addresses (for TCP and UDP)
@@ -245,6 +251,84 @@ impl Config {
     pub fn allow_networks(&self) -> &[IpNet] {
         &self.allow_networks
     }
+
+    fn normalize(mut self) -> Result<Self, String> {
+        if let Some(dns) = &self.dns {
+            if !dns.upstream_dns.is_empty() {
+                if !self.zones.is_empty() {
+                    return Err(
+                        "cannot configure both `zones` and `dns.upstream_dns`; use one style"
+                            .to_owned(),
+                    );
+                }
+
+                #[cfg(feature = "resolver")]
+                {
+                    self.zones = vec![ZoneConfig::root_forward(dns.upstream_dns.clone())?];
+                }
+
+                #[cfg(not(feature = "resolver"))]
+                {
+                    return Err("`dns.upstream_dns` requires the `resolver` feature".to_owned());
+                }
+            }
+        }
+
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DnsConfig {
+    upstream_dns: Vec<UpstreamDnsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum UpstreamDnsConfig {
+    Address(String),
+    #[cfg(feature = "resolver")]
+    Detailed(NameServerConfig),
+}
+
+impl UpstreamDnsConfig {
+    #[cfg(feature = "resolver")]
+    fn into_name_server_config(self) -> Result<NameServerConfig, String> {
+        match self {
+            Self::Address(address) => parse_upstream_dns_address(&address),
+            Self::Detailed(config) => Ok(config),
+        }
+    }
+}
+
+#[cfg(feature = "resolver")]
+fn parse_upstream_dns_address(address: &str) -> Result<NameServerConfig, String> {
+    let (protocol, address) = if let Some(addr) = address.strip_prefix("udp://") {
+        (Protocol::Udp, addr)
+    } else if let Some(addr) = address.strip_prefix("tcp://") {
+        (Protocol::Tcp, addr)
+    } else {
+        (Protocol::Udp, address)
+    };
+
+    let socket_addr = address
+        .parse::<SocketAddr>()
+        .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+        .map_err(|_| {
+            format!(
+                "invalid upstream DNS address `{address}`; expected `IP`, `IP:PORT`, `udp://IP:PORT`, or `tcp://IP:PORT`"
+            )
+        })?;
+
+    Ok(NameServerConfig {
+        socket_addr,
+        protocol,
+        tls_dns_name: None,
+        http_endpoint: None,
+        trust_negative_responses: false,
+        bind_addr: None,
+    })
 }
 
 /// Configuration for a zone
@@ -258,6 +342,24 @@ pub struct ZoneConfig {
 }
 
 impl ZoneConfig {
+    #[cfg(feature = "resolver")]
+    fn root_forward(upstreams: Vec<UpstreamDnsConfig>) -> Result<Self, String> {
+        let name_servers: Vec<NameServerConfig> = upstreams
+            .into_iter()
+            .map(UpstreamDnsConfig::into_name_server_config)
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self {
+            zone: ".".to_owned(),
+            zone_type_config: ZoneTypeConfig::External {
+                stores: vec![ExternalStoreConfig::Forward(ForwardConfig {
+                    name_servers: NameServerConfigGroup::from(name_servers),
+                    options: None,
+                })],
+            },
+        })
+    }
+
     #[warn(clippy::wildcard_enum_match_arm)] // make sure all cases are handled despite of non_exhaustive
     pub async fn load(
         &self,
@@ -444,4 +546,88 @@ where
     }
 
     deserializer.deserialize_any(MapOrSequence::<T>(Default::default()))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn supports_adguard_style_upstream_dns() {
+        let config = Config::from_yaml(
+            r#"
+listen_addrs_ipv4: ["127.0.0.1"]
+dns:
+  upstream_dns:
+    - 127.0.0.1:7874
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.zones.len(), 1);
+        assert_eq!(config.zones[0].zone, ".");
+
+        match &config.zones[0].zone_type_config {
+            ZoneTypeConfig::External { stores } => {
+                assert_eq!(stores.len(), 1);
+                match &stores[0] {
+                    #[cfg(feature = "resolver")]
+                    ExternalStoreConfig::Forward(config) => {
+                        assert_eq!(config.name_servers.len(), 1);
+                        let upstream = &config.name_servers[0];
+                        assert_eq!(upstream.socket_addr, "127.0.0.1:7874".parse().unwrap());
+                        assert_eq!(upstream.protocol, Protocol::Udp);
+                        assert!(!upstream.trust_negative_responses);
+                    }
+                    _ => panic!("expected a forward store"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_dns_defaults_port_53() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - 8.8.8.8
+"#,
+        )
+        .expect("config should parse");
+
+        match &config.zones[0].zone_type_config {
+            ZoneTypeConfig::External { stores } => match &stores[0] {
+                #[cfg(feature = "resolver")]
+                ExternalStoreConfig::Forward(config) => {
+                    assert_eq!(config.name_servers[0].socket_addr, "8.8.8.8:53".parse().unwrap());
+                }
+                _ => panic!("expected a forward store"),
+            },
+        }
+    }
+
+    #[test]
+    fn rejects_mixing_zones_and_upstream_dns() {
+        let err = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - 127.0.0.1:7874
+zones:
+  - zone: "."
+    zone_type: "External"
+    stores:
+      - type: "forward"
+        name_servers:
+          - socket_addr: "8.8.8.8:53"
+"#,
+        )
+        .expect_err("config should fail");
+
+        assert!(
+            err.to_string()
+                .contains("cannot configure both `zones` and `dns.upstream_dns`")
+        );
+    }
 }

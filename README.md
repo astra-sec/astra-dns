@@ -90,6 +90,19 @@ The server supports these core DNS settings:
 - `External` zones
 - `forward`, `blocklist`, and `recursor` stores
 
+For a simple router-style forwarding setup, the server also supports a compact
+AdGuard Home-inspired syntax:
+
+```yaml
+dns:
+  upstream_dns:
+    - 127.0.0.1:7874
+    - 8.8.8.8
+```
+
+That compact form is translated internally into a root `External` forward zone.
+Do not combine it with `zones` in the same config file.
+
 For ad-blocking, the server now imports a focused subset inspired by AdGuard
 Home:
 
