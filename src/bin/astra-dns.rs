@@ -463,7 +463,7 @@ struct ReloadSettings {
 
 impl ReloadSettings {
     fn from_effective_config(
-        args: &Cli,
+        _args: &Cli,
         config: &Config,
         config_path: &std::path::Path,
     ) -> Result<Self, String> {
