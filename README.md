@@ -8,22 +8,13 @@ pipeline: remote filter download, local user rules, sinkhole or `NXDOMAIN`
 blocking, and simple hosts-style overrides, all chained in front of the
 upstream forwarder.
 
-## Current Status
+## Features
 
 The repository currently works as:
 
 - a forwarding DNS server
 - an ad-blocking DNS server for a focused subset of AdGuard Home-style rules
 - a small experimentation base for DNS filtering features
-
-The current implementation has been verified with:
-
-- `cargo build`
-- `cargo test`
-- live DNS queries against a local test setup
-- config validation against the filter sources listed in `config.all.yaml`
-
-## What It Does Today
 
 With the default example config in [named.yaml](./named.yaml), the server:
 
@@ -243,74 +234,3 @@ Query the server:
 dig @127.0.0.1 -p 8053 example.com A
 dig @127.0.0.1 -p 8053 example.com A +tcp
 ```
-
-## Example Ad-Blocking Config
-
-```yaml
-listen_addrs_ipv4: ["127.0.0.1"]
-listen_port: 8053
-log_level: "Warn"
-
-filters:
-  - enabled: true
-    url: "https://example.com/filter.txt"
-
-user_rules:
-  - "@@||example.com^"
-  - "1.2.3.4 internal.example.com"
-
-filtering:
-  blocking_mode: default
-  blocking_ipv4: 0.0.0.0
-  blocking_ipv6: "::"
-
-zones:
-  - zone: "."
-    zone_type: "External"
-    stores:
-      - type: "forward"
-        name_servers:
-          - socket_addr: "8.8.8.8:53"
-            protocol: "udp"
-            trust_negative_responses: false
-```
-
-## TODO
-
-### Near-Term
-
-- add periodic filter refresh and retry behavior
-- persist downloaded filter lists on disk
-- add structured query logging
-- add basic stats for total queries, blocked queries, and filter counts
-- make block TTL configurable instead of hardcoded
-- add more integration tests around chained filtering behavior
-
-### Rule Coverage
-
-- support more AdGuard / ABP-style modifiers where they make sense for DNS
-- decide how to handle unsupported modifiers explicitly instead of silently
-  narrowing behavior
-- add wildcard and rewrite semantics beyond the current domain-focused subset
-- evaluate whether full syntax compatibility is a goal or whether the project
-  should intentionally remain DNS-centric
-
-### Product Hardening
-
-- replace `unwrap` in config loading paths with better errors
-- add filter download timeouts and backoff
-- add reload support without full restart
-- document migration expectations relative to AdGuard Home configs
-
-## About `config.all.yaml`
-
-`config.all.yaml` should currently be treated as a reference document, not as a
-fully supported contract.
-
-It is useful for:
-
-- identifying which AdGuard Home concepts may be worth borrowing
-- comparing future feature coverage
-- testing how close this server should get to AdGuard-style configuration
-
-It is not yet accurate to say that this project "supports `config.all.yaml`".

@@ -24,9 +24,7 @@ filters:
 user_rules:
 
 filtering:
-  blocking_mode: default
-  blocking_ipv4: 0.0.0.0
-  blocking_ipv6: "::"
+  blocking_mode: nxdomain
   rewrites:
     - ip:
       - "173.245.48.0/20"
