@@ -2,18 +2,30 @@
 
 `astra-dns` is a Rust DNS server built on top of Hickory DNS.
 
-The project started as a small Hickory-based DNS wrapper with custom YAML
-configuration. It now focuses on a router-friendly forwarding and filtering
-pipeline: remote filter download, local user rules, sinkhole or `NXDOMAIN`
-blocking, and simple hosts-style overrides, all chained in front of the
-upstream forwarder.
+This project started from a very specific OpenWrt pain point discussed by the
+community: if you want both ad blocking and Cloudflare best-IP redirection, you
+often end up chaining multiple DNS components such as MosDNS, AdGuard Home, and
+Mihomo, with a setup that works but is fairly complex to understand and
+maintain. See these two discussions for the original motivation:
+
+- OpenWrt Nikki discussion about combining MosDNS, AdGuard Home, and Mihomo:
+  https://github.com/nikkinikki-org/OpenWrt-nikki/discussions/197
+- CloudflareSpeedTest discussion about redirecting Cloudflare answers to the
+  fastest IP with mosdns:
+  https://github.com/XIU2/CloudflareSpeedTest/discussions/317
+
+`astra-dns` exists to collapse that workflow into a smaller, more direct DNS
+stack that can handle forwarding, filtering, and Cloudflare-oriented rewrite
+logic in one place.
 
 ## Features
 
-The repository currently works as:
+`astra-dns` focuses on a router-friendly forwarding and filtering
+pipeline built on Hickory DNS. The repository currently works as:
 
 - a forwarding DNS server
 - an ad-blocking DNS server for a focused subset of AdGuard Home-style rules
+- a Cloudflare-oriented DNS rewrite layer for best-IP style redirection
 - a small experimentation base for DNS filtering features
 
 With the default example config in [named.yaml](./named.yaml), the server:
