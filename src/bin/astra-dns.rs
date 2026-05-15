@@ -589,14 +589,22 @@ where
         event: &Event<'_>,
     ) -> fmt::Result {
         let now = OffsetDateTime::now_utc();
-        let now_secs = now.unix_timestamp();
+        let timestamp = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
 
         // Format values from the event's's metadata:
         let metadata = event.metadata();
         write!(
             &mut writer,
-            "{}:{}:{}",
-            now_secs,
+            "{} [{}] {}",
+            timestamp,
             metadata.level(),
             metadata.target()
         )?;

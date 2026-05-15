@@ -2,3 +2,4 @@
 Cargo.lock
 config.all.yaml
 TODO.md
+filters-cache/
