@@ -51,3 +51,7 @@ dns:
   upstream_dns:
     - 8.8.8.8
     - 8.8.4.4
+  # AdGuard Home-style DNS cache options
+  cache_size: 4096
+  # cache_ttl_min: 30
+  # cache_ttl_max: 600

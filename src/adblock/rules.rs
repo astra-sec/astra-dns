@@ -130,7 +130,8 @@ impl CompiledRuleSets {
     ) -> Result<Self, String> {
         let mut rules = RuleSets::default();
         let mut disabled_rules = HashSet::new();
-        let fetch_options = fetch_remote_filters.then(|| FilterFetchOptions::for_config_path(config_path));
+        let fetch_options =
+            fetch_remote_filters.then(|| FilterFetchOptions::for_config_path(config_path));
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
             if let Some(fetch_options) = &fetch_options {

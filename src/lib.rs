@@ -21,7 +21,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
 use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
-use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup};
+use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup, ResolverOpts};
 use hickory_server::authority::{AuthorityObject, ZoneType};
 use hickory_server::store::forwarder::ForwardAuthority;
 use hickory_server::store::forwarder::ForwardConfig;
@@ -227,7 +227,7 @@ impl Config {
 
                 #[cfg(feature = "resolver")]
                 {
-                    self.zones = vec![ZoneConfig::root_forward(dns.upstream_dns.clone())?];
+                    self.zones = vec![ZoneConfig::root_forward(dns.clone())?];
                 }
             }
         }
@@ -240,6 +240,9 @@ impl Config {
 #[serde(default, deny_unknown_fields)]
 struct DnsConfig {
     upstream_dns: Vec<UpstreamDnsConfig>,
+    cache_size: Option<usize>,
+    cache_ttl_min: Option<u64>,
+    cache_ttl_max: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -298,18 +301,46 @@ pub struct ZoneConfig {
 }
 
 impl ZoneConfig {
-    fn root_forward(upstreams: Vec<UpstreamDnsConfig>) -> Result<Self, String> {
-        let name_servers: Vec<NameServerConfig> = upstreams
+    fn root_forward(dns: DnsConfig) -> Result<Self, String> {
+        let DnsConfig {
+            upstream_dns,
+            cache_size,
+            cache_ttl_min,
+            cache_ttl_max,
+        } = dns;
+
+        let name_servers: Vec<NameServerConfig> = upstream_dns
             .into_iter()
             .map(UpstreamDnsConfig::into_name_server_config)
             .collect::<Result<_, _>>()?;
+
+        let options = if cache_size.is_some() || cache_ttl_min.is_some() || cache_ttl_max.is_some()
+        {
+            let mut options = ResolverOpts::default();
+            if let Some(cache_size) = cache_size {
+                options.cache_size = cache_size;
+            }
+            if let Some(cache_ttl_min) = cache_ttl_min {
+                let ttl = Duration::from_secs(cache_ttl_min);
+                options.positive_min_ttl = Some(ttl);
+                options.negative_min_ttl = Some(ttl);
+            }
+            if let Some(cache_ttl_max) = cache_ttl_max {
+                let ttl = Duration::from_secs(cache_ttl_max);
+                options.positive_max_ttl = Some(ttl);
+                options.negative_max_ttl = Some(ttl);
+            }
+            Some(options)
+        } else {
+            None
+        };
 
         Ok(Self {
             zone: ".".to_owned(),
             zone_type_config: ZoneTypeConfig::External {
                 stores: vec![ExternalStoreConfig::Forward(ForwardConfig {
                     name_servers: NameServerConfigGroup::from(name_servers),
-                    options: None,
+                    options,
                 })],
             },
         })
@@ -512,6 +543,39 @@ dns:
                         config.name_servers[0].socket_addr,
                         "8.8.8.8:53".parse().unwrap()
                     );
+                }
+                _ => panic!("expected a forward store"),
+            },
+        }
+    }
+
+    #[test]
+    fn supports_adguard_style_cache_options() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - 8.8.8.8
+  cache_size: 1024
+  cache_ttl_min: 30
+  cache_ttl_max: 600
+"#,
+        )
+        .expect("config should parse");
+
+        match &config.zones[0].zone_type_config {
+            ZoneTypeConfig::External { stores } => match &stores[0] {
+                #[cfg(feature = "resolver")]
+                ExternalStoreConfig::Forward(config) => {
+                    let options = config
+                        .options
+                        .as_ref()
+                        .expect("resolver options should exist");
+                    assert_eq!(options.cache_size, 1024);
+                    assert_eq!(options.positive_min_ttl, Some(Duration::from_secs(30)));
+                    assert_eq!(options.negative_min_ttl, Some(Duration::from_secs(30)));
+                    assert_eq!(options.positive_max_ttl, Some(Duration::from_secs(600)));
+                    assert_eq!(options.negative_max_ttl, Some(Duration::from_secs(600)));
                 }
                 _ => panic!("expected a forward store"),
             },

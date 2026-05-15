@@ -50,8 +50,8 @@ use tracing_subscriber::{
     EnvFilter,
     fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format},
     layer::SubscriberExt,
-    reload,
     registry::LookupSpan,
+    reload,
     util::SubscriberInitExt,
 };
 
@@ -283,7 +283,7 @@ where
             return Err(
                 "both 'user' and 'group' must be set together when requesting privilege drop"
                     .to_string(),
-            )
+            );
         }
     }
     #[cfg(not(target_family = "unix"))]
@@ -443,10 +443,7 @@ where
     Ok(())
 }
 
-fn update_log_level<S>(
-    handle: &reload::Handle<EnvFilter, S>,
-    level: Level,
-) -> Result<(), String>
+fn update_log_level<S>(handle: &reload::Handle<EnvFilter, S>, level: Level) -> Result<(), String>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
