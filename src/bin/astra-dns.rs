@@ -47,6 +47,7 @@ use tokio::{
 };
 use tracing::{Event, Level, Subscriber, error, info};
 use tracing_subscriber::{
+    filter::Directive,
     EnvFilter,
     fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format},
     layer::SubscriberExt,
@@ -119,10 +120,7 @@ fn main() -> Result<(), String> {
 fn run() -> Result<(), String> {
     let args = Cli::parse();
 
-    let initial_filter = EnvFilter::builder()
-        .with_default_directive(Level::WARN.into())
-        .from_env()
-        .map_err(|err| format!("failed to parse environment variable for tracing: {err}"))?;
+    let initial_filter = build_env_filter(Level::INFO)?;
     let (filter_layer, filter_handle) = reload::Layer::new(initial_filter);
 
     // Setup tracing for logging based on input
@@ -447,13 +445,43 @@ fn update_log_level<S>(handle: &reload::Handle<EnvFilter, S>, level: Level) -> R
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    let filter = EnvFilter::builder()
-        .with_default_directive(level.into())
-        .from_env()
-        .map_err(|err| format!("failed to parse environment variable for tracing: {err}"))?;
+    let filter = build_env_filter(level)?;
     handle
         .reload(filter)
         .map_err(|err| format!("failed to reload tracing filter: {err}"))
+}
+
+fn build_env_filter(level: Level) -> Result<EnvFilter, String> {
+    let mut filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env()
+        .map_err(|err| format!("failed to parse environment variable for tracing: {err}"))?;
+
+    let floor = hickory_server_level_floor(level);
+    let directive: Directive = format!("hickory_server={}", level_name(floor))
+        .parse()
+        .map_err(|err| format!("failed to parse hickory_server filter directive: {err}"))?;
+    filter = filter.add_directive(directive);
+
+    Ok(filter)
+}
+
+fn hickory_server_level_floor(global: Level) -> Level {
+    if global == Level::ERROR {
+        Level::ERROR
+    } else {
+        Level::WARN
+    }
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::ERROR => "error",
+        Level::WARN => "warn",
+        Level::INFO => "info",
+        Level::DEBUG => "debug",
+        Level::TRACE => "trace",
+    }
 }
 
 struct LoadedRuntimeConfig {

@@ -1,7 +1,7 @@
 # Basic configuration
 listen_addrs_ipv4: ["0.0.0.0"]
 listen_port: 5553
-log_level: "Warn"
+log_level: "Info"
 
 filters:
   - enabled: false
