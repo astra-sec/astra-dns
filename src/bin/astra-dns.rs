@@ -155,7 +155,11 @@ where
     let config = args.config.clone();
     let config_path = std::path::Path::new(&config);
 
-    let loaded = load_runtime_config(config_path).await?;
+    let loaded = if args.validate {
+        validate_runtime_config(config_path)?
+    } else {
+        load_runtime_config(config_path).await?
+    };
     let config = loaded.config;
     update_log_level(&log_filter_handle, config.log_level())?;
     info!("Hickory DNS {} starting...", hickory_client::version());
@@ -379,6 +383,20 @@ async fn load_runtime_config(config_path: &std::path::Path) -> Result<LoadedRunt
     Ok(LoadedRuntimeConfig {
         config,
         catalog: Arc::new(catalog),
+    })
+}
+
+fn validate_runtime_config(config_path: &std::path::Path) -> Result<LoadedRuntimeConfig, String> {
+    let config = Config::read_config(config_path)
+        .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
+
+    if let Some(runtime_config) = config.adblock_runtime_config() {
+        CompiledRuleSets::validate(runtime_config)?;
+    }
+
+    Ok(LoadedRuntimeConfig {
+        config,
+        catalog: Arc::new(Catalog::new()),
     })
 }
 

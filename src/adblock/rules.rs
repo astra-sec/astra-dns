@@ -116,25 +116,67 @@ enum RuleOrigin {
 
 impl CompiledRuleSets {
     pub async fn build(config: AdblockRuntimeConfig, config_path: &Path) -> Result<Self, String> {
+        Self::build_with_fetch_mode(config, config_path, true).await
+    }
+
+    pub fn validate(config: AdblockRuntimeConfig) -> Result<Self, String> {
+        Self::build_without_remote_fetch(config)
+    }
+
+    async fn build_with_fetch_mode(
+        config: AdblockRuntimeConfig,
+        config_path: &Path,
+        fetch_remote_filters: bool,
+    ) -> Result<Self, String> {
         let mut rules = RuleSets::default();
         let mut disabled_rules = HashSet::new();
-        let fetch_options = FilterFetchOptions::for_config_path(config_path);
+        let fetch_options = fetch_remote_filters.then(|| FilterFetchOptions::for_config_path(config_path));
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
-            let contents = match fetch_filter(filter, &fetch_options).await {
-                Ok(contents) => contents,
-                Err(err) => {
-                    warn!("{err}");
-                    continue;
-                }
-            };
-            parse_rule_lines(
-                &contents,
-                RuleOrigin::RemoteFilter,
-                &mut rules,
-                &mut disabled_rules,
-            )?;
+            if let Some(fetch_options) = &fetch_options {
+                let contents = match fetch_filter(filter, fetch_options).await {
+                    Ok(contents) => contents,
+                    Err(err) => {
+                        warn!("{err}");
+                        continue;
+                    }
+                };
+                parse_rule_lines(
+                    &contents,
+                    RuleOrigin::RemoteFilter,
+                    &mut rules,
+                    &mut disabled_rules,
+                )?;
+            }
         }
+
+        for line in &config.user_rules {
+            parse_rule_line(line, RuleOrigin::UserRule, &mut rules, &mut disabled_rules)?;
+        }
+
+        apply_badfilters(&mut rules, &disabled_rules);
+
+        Ok(Self {
+            overrides: rules.overrides,
+            block_exact: rules.block_exact,
+            block_subdomains: rules.block_subdomains,
+            allow_exact: rules.allow_exact,
+            allow_subdomains: rules.allow_subdomains,
+            block_rules: rules.block_rules,
+            allow_rules: rules.allow_rules,
+            domain_rewrites: compile_domain_rewrites(&config.filtering.rewrites)?,
+            answer_ip_rewrites: compile_answer_ip_rewrites(&config.filtering.rewrites)?,
+            cname_rewrites: compile_cname_rewrites(&config.filtering.rewrites)?,
+            blocking_mode: config.filtering.blocking_mode,
+            blocking_ipv4: config.filtering.blocking_ipv4,
+            blocking_ipv6: config.filtering.blocking_ipv6,
+            block_ttl: 60,
+        })
+    }
+
+    fn build_without_remote_fetch(config: AdblockRuntimeConfig) -> Result<Self, String> {
+        let mut rules = RuleSets::default();
+        let mut disabled_rules = HashSet::new();
 
         for line in &config.user_rules {
             parse_rule_line(line, RuleOrigin::UserRule, &mut rules, &mut disabled_rules)?;

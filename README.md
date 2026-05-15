@@ -215,6 +215,9 @@ Validate config only:
 ./target/debug/astra-dns --validate -c named.yaml
 ```
 
+`--validate` only checks local YAML content and locally defined rules. It does
+not download remote filter lists.
+
 Reload configuration after editing the YAML:
 
 ```bash
