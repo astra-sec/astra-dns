@@ -12,7 +12,7 @@ use tracing::warn;
 
 use super::{
     BlockingMode, FilterConfig, FilteringConfig,
-    config::RewriteConfig,
+    config::{RewriteAnswerConfig, RewriteConfig},
     fetch::{FilterFetchOptions, fetch_filter},
 };
 
@@ -618,7 +618,7 @@ fn compile_domain_rewrites(rewrites: &[RewriteConfig]) -> Result<Vec<DomainRewri
         let Some(domain) = rewrite.domain.as_ref() else {
             continue;
         };
-        let answer = parse_override_answer(&rewrite.answer)?;
+        let answer = parse_override_answers(&rewrite.answer)?;
         let pattern = parse_domain_pattern(domain)?;
         let entry = compiled.entry(pattern).or_default();
         merge_override_rule(entry, &answer);
@@ -637,7 +637,7 @@ fn compile_answer_ip_rewrites(
         if rewrite.ip.is_empty() {
             continue;
         }
-        let answer = parse_override_answer(&rewrite.answer)?;
+        let answer = parse_override_answers(&rewrite.answer)?;
         let mut nets = Vec::new();
         for net in &rewrite.ip {
             nets.push(
@@ -656,7 +656,7 @@ fn compile_cname_rewrites(rewrites: &[RewriteConfig]) -> Result<Vec<CnameRewrite
         if rewrite.cname.is_empty() {
             continue;
         }
-        let answer = parse_override_answer(&rewrite.answer)?;
+        let answer = parse_override_answers(&rewrite.answer)?;
         let mut patterns = Vec::new();
         for item in &rewrite.cname {
             let raw = item.strip_prefix("domain:").unwrap_or(item);
@@ -667,13 +667,23 @@ fn compile_cname_rewrites(rewrites: &[RewriteConfig]) -> Result<Vec<CnameRewrite
     Ok(compiled)
 }
 
-fn parse_override_answer(answer: &str) -> Result<OverrideRule, String> {
-    let ip = IpAddr::from_str(answer)
-        .map_err(|err| format!("invalid rewrite answer {answer}: {err}"))?;
+fn parse_override_answers(answer: &RewriteAnswerConfig) -> Result<OverrideRule, String> {
     let mut rule = OverrideRule::default();
-    match ip {
-        IpAddr::V4(ipv4) => rule.ipv4.push(ipv4),
-        IpAddr::V6(ipv6) => rule.ipv6.push(ipv6),
+    for value in answer.values() {
+        let ip = IpAddr::from_str(value)
+            .map_err(|err| format!("invalid rewrite answer {value}: {err}"))?;
+        match ip {
+            IpAddr::V4(ipv4) => {
+                if !rule.ipv4.contains(&ipv4) {
+                    rule.ipv4.push(ipv4);
+                }
+            }
+            IpAddr::V6(ipv6) => {
+                if !rule.ipv6.contains(&ipv6) {
+                    rule.ipv6.push(ipv6);
+                }
+            }
+        }
     }
     Ok(rule)
 }
@@ -789,17 +799,46 @@ mod tests {
         let rewrites = vec![
             RewriteConfig {
                 domain: Some("its.pkupi.com".to_string()),
-                answer: "198.41.198.152".to_string(),
+                answer: RewriteAnswerConfig::Single("198.41.198.152".to_string()),
                 ..RewriteConfig::default()
             },
             RewriteConfig {
                 domain: Some("its.pkupi.com".to_string()),
-                answer: "104.27.105.80".to_string(),
+                answer: RewriteAnswerConfig::Single("104.27.105.80".to_string()),
                 ..RewriteConfig::default()
             },
         ];
 
         let compiled = compile_domain_rewrites(&rewrites).expect("compile failed");
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled[0].answer.ipv4.len(), 2);
+    }
+
+    #[test]
+    fn parses_rewrite_answer_array() {
+        let answer = parse_override_answers(&RewriteAnswerConfig::Multiple(vec![
+            "198.41.198.152".to_string(),
+            "104.27.105.80".to_string(),
+            "2606:4700::681b:6950".to_string(),
+        ]))
+        .expect("parse failed");
+
+        assert_eq!(answer.ipv4.len(), 2);
+        assert_eq!(answer.ipv6.len(), 1);
+    }
+
+    #[test]
+    fn compiles_answer_ip_rewrite_with_multiple_answers() {
+        let rewrites = vec![RewriteConfig {
+            ip: vec!["1.1.1.0/24".to_string()],
+            answer: RewriteAnswerConfig::Multiple(vec![
+                "198.41.198.152".to_string(),
+                "104.27.105.80".to_string(),
+            ]),
+            ..RewriteConfig::default()
+        }];
+
+        let compiled = compile_answer_ip_rewrites(&rewrites).expect("compile failed");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].answer.ipv4.len(), 2);
     }

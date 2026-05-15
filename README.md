@@ -147,6 +147,7 @@ Currently supported `filtering.rewrites` shapes:
 - wildcard subdomain rewrite such as `domain: '*.vrdesktop.net'`
 - answer-IP rewrite based on CIDR match such as `ip: ["1.1.1.0/24"]`
 - CNAME-target rewrite such as `cname: ["domain:cdn.cloudflare.net"]`
+- `answer` may be either a single IP string or an array of IP strings; array answers return all listed A/AAAA records
 
 Currently supported blocking modes:
 

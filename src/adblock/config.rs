@@ -34,5 +34,24 @@ pub struct RewriteConfig {
     pub domain: Option<String>,
     pub ip: Vec<String>,
     pub cname: Vec<String>,
-    pub answer: String,
+    pub answer: RewriteAnswerConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(untagged)]
+pub enum RewriteAnswerConfig {
+    #[default]
+    Empty,
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl RewriteAnswerConfig {
+    pub fn values(&self) -> &[String] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(value) => std::slice::from_ref(value),
+            Self::Multiple(values) => values.as_slice(),
+        }
+    }
 }
