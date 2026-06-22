@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -21,6 +21,7 @@ pub struct AdblockRuntimeConfig {
     pub filters: Vec<FilterConfig>,
     pub user_rules: Vec<String>,
     pub filtering: FilteringConfig,
+    pub filter_cache_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -115,8 +116,8 @@ enum RuleOrigin {
 }
 
 impl CompiledRuleSets {
-    pub async fn build(config: AdblockRuntimeConfig, config_path: &Path) -> Result<Self, String> {
-        Self::build_with_fetch_mode(config, config_path, true).await
+    pub async fn build(config: AdblockRuntimeConfig, _config_path: &Path) -> Result<Self, String> {
+        Self::build_with_fetch_mode(config, true).await
     }
 
     pub fn validate(config: AdblockRuntimeConfig) -> Result<Self, String> {
@@ -125,13 +126,12 @@ impl CompiledRuleSets {
 
     async fn build_with_fetch_mode(
         config: AdblockRuntimeConfig,
-        config_path: &Path,
         fetch_remote_filters: bool,
     ) -> Result<Self, String> {
         let mut rules = RuleSets::default();
         let mut disabled_rules = HashSet::new();
         let fetch_options =
-            fetch_remote_filters.then(|| FilterFetchOptions::for_config_path(config_path));
+            fetch_remote_filters.then(|| FilterFetchOptions::new(config.filter_cache_dir.clone()));
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
             if let Some(fetch_options) = &fetch_options {

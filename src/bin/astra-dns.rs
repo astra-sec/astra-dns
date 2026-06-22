@@ -47,8 +47,8 @@ use tokio::{
 };
 use tracing::{Event, Level, Subscriber, error, info};
 use tracing_subscriber::{
-    filter::Directive,
     EnvFilter,
+    filter::Directive,
     fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format},
     layer::SubscriberExt,
     registry::LookupSpan,

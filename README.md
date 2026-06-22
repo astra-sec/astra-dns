@@ -88,6 +88,7 @@ The server supports these core DNS settings:
 - listen IPv4 / IPv6 addresses
 - listen port
 - `log_level`
+- `filter_cache_dir`
 - TCP / UDP enable or disable
 - TCP timeout
 - `External` zones
@@ -96,6 +97,11 @@ The server supports these core DNS settings:
 `log_level` supports `Trace`, `Debug`, `Info`, `Warn`, and `Error`.
 The default is `Warn` so normal router deployments do not spam per-query `INFO`
 logs unless you explicitly opt in.
+
+`filter_cache_dir` controls where downloaded remote filter lists are cached.
+The default is `/tmp/astra-dns/filters-cache`, which keeps router deployments
+from writing these refreshes to flash unless you explicitly choose a persistent
+directory.
 
 For a simple router-style forwarding setup, the server also supports a compact
 AdGuard Home-inspired syntax:
@@ -181,7 +187,6 @@ Notably missing:
 - most non-DNS ABP / AdGuard modifiers
 - client-specific filtering
 - periodic filter refresh
-- on-disk filter cache
 - hot reload
 - query log persistence
 - per-filter statistics

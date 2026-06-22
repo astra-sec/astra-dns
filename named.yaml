@@ -2,6 +2,7 @@
 listen_addrs_ipv4: ["0.0.0.0"]
 listen_port: 5553
 log_level: "Info"
+filter_cache_dir: /tmp/astra-dns/filters-cache
 
 filters:
   - enabled: false

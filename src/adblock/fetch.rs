@@ -22,14 +22,9 @@ pub struct FilterFetchOptions {
 }
 
 impl FilterFetchOptions {
-    pub fn for_config_path(config_path: &Path) -> Self {
-        let cache_root = config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("filters-cache");
-
+    pub fn new(cache_dir: PathBuf) -> Self {
         Self {
-            cache_dir: cache_root,
+            cache_dir,
             connect_timeout: Duration::from_secs(DEFAULT_FILTER_CONNECT_TIMEOUT_SECS),
             read_timeout: Duration::from_secs(DEFAULT_FILTER_READ_TIMEOUT_SECS),
         }

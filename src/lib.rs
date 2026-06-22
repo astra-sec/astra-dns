@@ -12,6 +12,7 @@ use std::{
     fs::File,
     io::Read,
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -39,6 +40,7 @@ pub use prometheus_server::PrometheusServer;
 
 static DEFAULT_PORT: u16 = 53;
 static DEFAULT_TCP_REQUEST_TIMEOUT: u64 = 5;
+static DEFAULT_FILTER_CACHE_DIR: &str = "/tmp/astra-dns/filters-cache";
 
 /// Server configuration
 #[derive(Deserialize, Debug)]
@@ -72,6 +74,8 @@ pub struct Config {
     tcp_request_timeout: Option<u64>,
     /// Level at which to log, default is WARN
     log_level: Option<String>,
+    /// Directory for downloaded remote filter list cache files.
+    filter_cache_dir: Option<PathBuf>,
     /// User to run the server as.
     ///
     /// Only supported on Unix-like platforms. When both user and group are set, the server will
@@ -203,6 +207,12 @@ impl Config {
         &self.filtering
     }
 
+    pub fn filter_cache_dir(&self) -> PathBuf {
+        self.filter_cache_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_FILTER_CACHE_DIR))
+    }
+
     pub fn adblock_runtime_config(&self) -> Option<AdblockRuntimeConfig> {
         if !adblock::is_adblock_enabled(&self.filters, &self.user_rules, &self.filtering) {
             return None;
@@ -212,6 +222,7 @@ impl Config {
             filters: self.filters.clone(),
             user_rules: self.user_rules.clone(),
             filtering: self.filtering.clone(),
+            filter_cache_dir: self.filter_cache_dir(),
         })
     }
 
@@ -580,6 +591,39 @@ dns:
                 _ => panic!("expected a forward store"),
             },
         }
+    }
+
+    #[test]
+    fn filter_cache_dir_defaults_to_tmp() {
+        let config = Config::from_yaml("").expect("config should parse");
+
+        assert_eq!(
+            config.filter_cache_dir(),
+            PathBuf::from("/tmp/astra-dns/filters-cache")
+        );
+    }
+
+    #[test]
+    fn supports_custom_filter_cache_dir() {
+        let config = Config::from_yaml(
+            r#"
+filter_cache_dir: /mnt/storage/astra-dns/filters-cache
+filters:
+  - enabled: true
+    url: https://example.test/filter.txt
+    id: 7
+"#,
+        )
+        .expect("config should parse");
+
+        let runtime = config
+            .adblock_runtime_config()
+            .expect("adblock should be enabled");
+
+        assert_eq!(
+            runtime.filter_cache_dir,
+            PathBuf::from("/mnt/storage/astra-dns/filters-cache")
+        );
     }
 
     #[test]
