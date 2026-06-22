@@ -73,6 +73,10 @@ pub async fn fetch_filter(
 }
 
 fn persist_cached_filter(cache_path: &Path, contents: &str) -> Result<(), String> {
+    if matches!(fs::read_to_string(cache_path), Ok(existing) if existing == contents) {
+        return Ok(());
+    }
+
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             format!(
