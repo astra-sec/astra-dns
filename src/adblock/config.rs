@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+};
 
 use serde::Deserialize;
 
@@ -26,6 +29,28 @@ pub struct FilteringConfig {
     pub blocking_ipv6: Option<Ipv6Addr>,
     pub blocking_mode: BlockingMode,
     pub rewrites: Vec<RewriteConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanHostsConfig {
+    pub enabled: bool,
+    pub source: PathBuf,
+    pub domain: Option<String>,
+    pub include_unqualified: bool,
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for LanHostsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            source: PathBuf::from("/var/dhcp.leases"),
+            domain: Some("lan".to_owned()),
+            include_unqualified: true,
+            refresh_interval_secs: 60,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

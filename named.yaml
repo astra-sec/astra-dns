@@ -4,6 +4,13 @@ listen_port: 5553
 log_level: "Info"
 filter_cache_dir: /tmp/astra-dns/filters-cache
 
+lan_hosts:
+  enabled: true
+  source: /var/dhcp.leases
+  domain: lan
+  include_unqualified: true
+  refresh_interval_secs: 60
+
 filters:
   - enabled: false
     url: https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt

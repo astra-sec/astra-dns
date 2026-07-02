@@ -34,6 +34,7 @@ mod prometheus_server;
 
 pub use adblock::{
     AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterConfig, FilteringConfig,
+    LanHostsConfig,
 };
 #[cfg(feature = "prometheus-metrics")]
 pub use prometheus_server::PrometheusServer;
@@ -101,6 +102,9 @@ pub struct Config {
     /// Blocking behavior inspired by AdGuard Home's `filtering`
     #[serde(default)]
     filtering: FilteringConfig,
+    /// LAN hostname source, currently using dnsmasq/OpenWrt lease-file format.
+    #[serde(default)]
+    lan_hosts: LanHostsConfig,
 }
 
 impl Config {
@@ -207,6 +211,10 @@ impl Config {
         &self.filtering
     }
 
+    pub fn lan_hosts(&self) -> &LanHostsConfig {
+        &self.lan_hosts
+    }
+
     pub fn filter_cache_dir(&self) -> PathBuf {
         self.filter_cache_dir
             .clone()
@@ -214,7 +222,12 @@ impl Config {
     }
 
     pub fn adblock_runtime_config(&self) -> Option<AdblockRuntimeConfig> {
-        if !adblock::is_adblock_enabled(&self.filters, &self.user_rules, &self.filtering) {
+        if !adblock::is_adblock_enabled(
+            &self.filters,
+            &self.user_rules,
+            &self.filtering,
+            &self.lan_hosts,
+        ) {
             return None;
         }
 
@@ -223,23 +236,24 @@ impl Config {
             user_rules: self.user_rules.clone(),
             filtering: self.filtering.clone(),
             filter_cache_dir: self.filter_cache_dir(),
+            lan_hosts: self.lan_hosts.clone(),
         })
     }
 
     fn normalize(mut self) -> Result<Self, String> {
-        if let Some(dns) = &self.dns {
-            if !dns.upstream_dns.is_empty() {
-                if !self.zones.is_empty() {
-                    return Err(
-                        "cannot configure both `zones` and `dns.upstream_dns`; use one style"
-                            .to_owned(),
-                    );
-                }
+        if let Some(dns) = &self.dns
+            && !dns.upstream_dns.is_empty()
+        {
+            if !self.zones.is_empty() {
+                return Err(
+                    "cannot configure both `zones` and `dns.upstream_dns`; use one style"
+                        .to_owned(),
+                );
+            }
 
-                #[cfg(feature = "resolver")]
-                {
-                    self.zones = vec![ZoneConfig::root_forward(dns.clone())?];
-                }
+            #[cfg(feature = "resolver")]
+            {
+                self.zones = vec![ZoneConfig::root_forward(dns.clone())?];
             }
         }
 
@@ -398,7 +412,7 @@ impl ZoneConfig {
 
                             Arc::new(forwarder)
                         }
-                        _ => return empty_stores_error(),
+                        ExternalStoreConfig::Default => return empty_stores_error(),
                     };
 
                     authorities.push(authority);
@@ -624,6 +638,17 @@ filters:
             runtime.filter_cache_dir,
             PathBuf::from("/mnt/storage/astra-dns/filters-cache")
         );
+    }
+
+    #[test]
+    fn lan_hosts_default_to_enabled_minute_refresh() {
+        let config = Config::from_yaml("").expect("config should parse");
+
+        assert!(config.lan_hosts().enabled);
+        assert_eq!(config.lan_hosts().source, PathBuf::from("/var/dhcp.leases"));
+        assert_eq!(config.lan_hosts().domain.as_deref(), Some("lan"));
+        assert!(config.lan_hosts().include_unqualified);
+        assert_eq!(config.lan_hosts().refresh_interval_secs, 60);
     }
 
     #[test]

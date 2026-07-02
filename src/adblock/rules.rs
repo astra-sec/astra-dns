@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -8,10 +9,10 @@ use std::{
 use hickory_proto::rr::RecordType;
 use ipnet::IpNet;
 use regex::Regex;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use super::{
-    BlockingMode, FilterConfig, FilteringConfig,
+    BlockingMode, FilterConfig, FilteringConfig, LanHostsConfig,
     config::{RewriteAnswerConfig, RewriteConfig},
     fetch::{FilterFetchOptions, fetch_filter},
 };
@@ -22,6 +23,13 @@ pub struct AdblockRuntimeConfig {
     pub user_rules: Vec<String>,
     pub filtering: FilteringConfig,
     pub filter_cache_dir: PathBuf,
+    pub lan_hosts: LanHostsConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct LanHostOverrides {
+    pub overrides: HashMap<String, OverrideRule>,
+    pub ptr_overrides: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,6 +41,7 @@ pub struct OverrideRule {
 #[derive(Clone, Debug, Default)]
 pub struct RuleSets {
     pub overrides: HashMap<String, OverrideRule>,
+    pub ptr_overrides: HashMap<String, Vec<String>>,
     pub block_exact: HashSet<String>,
     pub block_subdomains: HashSet<String>,
     pub allow_exact: HashSet<String>,
@@ -44,6 +53,7 @@ pub struct RuleSets {
 #[derive(Clone, Debug)]
 pub struct CompiledRuleSets {
     pub overrides: HashMap<String, OverrideRule>,
+    pub ptr_overrides: HashMap<String, Vec<String>>,
     pub block_exact: HashSet<String>,
     pub block_subdomains: HashSet<String>,
     pub allow_exact: HashSet<String>,
@@ -57,6 +67,7 @@ pub struct CompiledRuleSets {
     pub blocking_ipv4: Option<Ipv4Addr>,
     pub blocking_ipv6: Option<Ipv6Addr>,
     pub block_ttl: u32,
+    pub lan_hosts: LanHostsConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +170,7 @@ impl CompiledRuleSets {
 
         Ok(Self {
             overrides: rules.overrides,
+            ptr_overrides: rules.ptr_overrides,
             block_exact: rules.block_exact,
             block_subdomains: rules.block_subdomains,
             allow_exact: rules.allow_exact,
@@ -172,6 +184,7 @@ impl CompiledRuleSets {
             blocking_ipv4: config.filtering.blocking_ipv4,
             blocking_ipv6: config.filtering.blocking_ipv6,
             block_ttl: 60,
+            lan_hosts: config.lan_hosts,
         })
     }
 
@@ -187,6 +200,7 @@ impl CompiledRuleSets {
 
         Ok(Self {
             overrides: rules.overrides,
+            ptr_overrides: rules.ptr_overrides,
             block_exact: rules.block_exact,
             block_subdomains: rules.block_subdomains,
             allow_exact: rules.allow_exact,
@@ -200,6 +214,7 @@ impl CompiledRuleSets {
             blocking_ipv4: config.filtering.blocking_ipv4,
             blocking_ipv6: config.filtering.blocking_ipv6,
             block_ttl: 60,
+            lan_hosts: config.lan_hosts,
         })
     }
 }
@@ -485,6 +500,100 @@ fn parse_hosts_rule(line: &str) -> Option<(IpAddr, Vec<String>)> {
     Some((ip, domains))
 }
 
+pub(super) fn load_lan_host_overrides(config: &LanHostsConfig) -> LanHostOverrides {
+    let mut leases = LanHostOverrides::default();
+    if !config.enabled {
+        return leases;
+    }
+
+    let contents = match fs::read_to_string(&config.source) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            debug!(
+                "LAN hosts source {:?} does not exist; skipping",
+                config.source
+            );
+            return leases;
+        }
+        Err(err) => {
+            warn!("unable to read LAN hosts source {:?}: {err}", config.source);
+            return leases;
+        }
+    };
+
+    let mut loaded = 0usize;
+    for line in contents.lines() {
+        let Some(lease) = parse_dhcp_lease_line(line, config) else {
+            continue;
+        };
+
+        for domain in lease.domains {
+            add_override_to_map(lease.ip, &domain, &mut leases.overrides);
+            loaded += 1;
+        }
+
+        add_ptr_override_to_map(lease.ip, &lease.ptr_domain, &mut leases.ptr_overrides);
+    }
+
+    info!(
+        "loaded {loaded} LAN hostname overrides from {:?}",
+        config.source
+    );
+    leases
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DhcpLeaseRule {
+    ip: IpAddr,
+    domains: Vec<String>,
+    ptr_domain: String,
+}
+
+fn parse_dhcp_lease_line(line: &str, config: &LanHostsConfig) -> Option<DhcpLeaseRule> {
+    let mut parts = line.split_whitespace();
+    let _expires = parts.next()?;
+    let _mac = parts.next()?;
+    let ip = IpAddr::from_str(parts.next()?).ok()?;
+    let hostname = parts.next()?;
+    if hostname == "*" {
+        return None;
+    }
+
+    let hostname = normalize_domain(hostname)?;
+    let mut domains = Vec::new();
+
+    if config.include_unqualified {
+        domains.push(hostname.clone());
+    }
+
+    let mut ptr_domain = hostname.clone();
+    if let Some(domain) = config.domain.as_deref().and_then(normalize_domain) {
+        let fqdn = if hostname == domain || hostname.ends_with(&format!(".{domain}")) {
+            hostname
+        } else {
+            format!("{hostname}.{domain}")
+        };
+
+        if !domains.contains(&fqdn) {
+            domains.push(fqdn);
+        }
+        ptr_domain = domains
+            .last()
+            .expect("domain was just pushed or already present")
+            .clone();
+    }
+
+    if domains.is_empty() {
+        return None;
+    }
+
+    Some(DhcpLeaseRule {
+        ip,
+        domains,
+        ptr_domain,
+    })
+}
+
 fn normalize_domain(input: &str) -> Option<String> {
     let candidate = input
         .trim()
@@ -511,7 +620,11 @@ fn normalize_domain(input: &str) -> Option<String> {
 }
 
 fn add_override(ip: IpAddr, domain: &str, rules: &mut RuleSets) {
-    let entry = rules.overrides.entry(domain.to_owned()).or_default();
+    add_override_to_map(ip, domain, &mut rules.overrides);
+}
+
+fn add_override_to_map(ip: IpAddr, domain: &str, overrides: &mut HashMap<String, OverrideRule>) {
+    let entry = overrides.entry(domain.to_owned()).or_default();
     match ip {
         IpAddr::V4(ipv4) => {
             if !entry.ipv4.contains(&ipv4) {
@@ -522,6 +635,40 @@ fn add_override(ip: IpAddr, domain: &str, rules: &mut RuleSets) {
             if !entry.ipv6.contains(&ipv6) {
                 entry.ipv6.push(ipv6);
             }
+        }
+    }
+}
+
+fn add_ptr_override_to_map(
+    ip: IpAddr,
+    domain: &str,
+    ptr_overrides: &mut HashMap<String, Vec<String>>,
+) {
+    let reverse = reverse_lookup_name(ip);
+    let entry = ptr_overrides.entry(reverse).or_default();
+    let domain = domain.to_owned();
+    if !entry.contains(&domain) {
+        entry.push(domain);
+    }
+}
+
+fn reverse_lookup_name(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            format!(
+                "{}.{}.{}.{}.in-addr.arpa",
+                octets[3], octets[2], octets[1], octets[0]
+            )
+        }
+        IpAddr::V6(ipv6) => {
+            let octets = ipv6.octets();
+            let mut nibbles = Vec::with_capacity(32);
+            for octet in octets.iter().rev() {
+                nibbles.push(format!("{:x}", octet & 0x0f));
+                nibbles.push(format!("{:x}", octet >> 4));
+            }
+            format!("{}.ip6.arpa", nibbles.join("."))
         }
     }
 }
@@ -760,6 +907,67 @@ mod tests {
                 .expect("override missing")
                 .ipv4,
             vec![Ipv4Addr::new(1, 2, 3, 4)]
+        );
+    }
+
+    #[test]
+    fn parses_dhcp_lease_hostnames() {
+        let config = LanHostsConfig::default();
+        let lease = parse_dhcp_lease_line(
+            "1783038459 e8:9c:25:7d:64:b7 192.168.81.169 truenas *",
+            &config,
+        )
+        .expect("lease should parse");
+
+        assert_eq!(lease.ip, IpAddr::V4(Ipv4Addr::new(192, 168, 81, 169)));
+        assert_eq!(lease.domains, vec!["truenas", "truenas.lan"]);
+        assert_eq!(lease.ptr_domain, "truenas.lan");
+    }
+
+    #[test]
+    fn skips_dhcp_lease_without_hostname() {
+        let config = LanHostsConfig::default();
+        assert!(
+            parse_dhcp_lease_line(
+                "1783039575 46:2a:ef:be:fe:67 192.168.81.112 * 01:46:2a:ef:be:fe:67",
+                &config,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn honors_dhcp_lease_domain_config() {
+        let config = LanHostsConfig {
+            domain: Some("home.arpa".to_string()),
+            include_unqualified: false,
+            ..LanHostsConfig::default()
+        };
+        let lease = parse_dhcp_lease_line(
+            "1783043760 ea:22:f1:47:f0:97 192.168.81.247 Mac 01:ea:22:f1:47:f0:97",
+            &config,
+        )
+        .expect("lease should parse");
+
+        assert_eq!(lease.domains, vec!["mac.home.arpa"]);
+        assert_eq!(lease.ptr_domain, "mac.home.arpa");
+    }
+
+    #[test]
+    fn builds_dhcp_lease_ptr_overrides() {
+        let mut rules = RuleSets::default();
+        let config = LanHostsConfig::default();
+        let lease = parse_dhcp_lease_line(
+            "1783038459 e8:9c:25:7d:64:b7 192.168.81.169 truenas *",
+            &config,
+        )
+        .expect("lease should parse");
+
+        add_ptr_override_to_map(lease.ip, &lease.ptr_domain, &mut rules.ptr_overrides);
+
+        assert_eq!(
+            rules.ptr_overrides.get("169.81.168.192.in-addr.arpa"),
+            Some(&vec!["truenas.lan".to_string()])
         );
     }
 

@@ -326,7 +326,7 @@ where
         let result = server_task
             .await
             .map_err(|err| format!("server task failed: {err}"))?;
-        return finish_server_run(result, runtime_handles).await;
+        finish_server_run(result, runtime_handles).await
     }
 
     #[cfg(not(unix))]

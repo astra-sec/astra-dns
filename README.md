@@ -34,12 +34,15 @@ With the default example config in [named.yaml](./named.yaml), the server:
 - accepts both UDP and TCP DNS queries
 - defines the root zone `.`
 - forwards all queries to `8.8.8.8:53`
+- reads dnsmasq/OpenWrt DHCP leases from `/var/dhcp.leases` for LAN hostname
+  and reverse PTR overrides when that file exists
 
 If ad-blocking config is added, the server can also:
 
 - download remote filter lists from `filters[].url`
 - parse a small subset of AdGuard-style domain blocking rules
 - apply local `user_rules`
+- apply DHCP lease hostnames and reverse PTRs as local answers
 - apply a focused subset of `filtering.rewrites`
 - allowlist domains before block rules are applied
 - return sinkhole IPs or `NXDOMAIN` for blocked domains
@@ -127,6 +130,30 @@ Home:
 - `filtering.rewrites`
 
 This is intentionally not full `config.all.yaml` compatibility.
+
+For router LAN names, `lan_hosts` reads dnsmasq/OpenWrt lease files using the
+standard five-column shape:
+
+```text
+expires mac ip hostname clientid
+```
+
+By default, this support is enabled and reads `/var/dhcp.leases`. Hostnames set
+to `*` are ignored. Each lease hostname is exposed both as the bare hostname and
+under the configured LAN domain, which defaults to `lan`. Reverse lookups return
+the domain-qualified hostname when a domain is configured. Lease files are
+loaded at startup and refreshed every 60 seconds by default; set
+`refresh_interval_secs` to `0` to only load leases at startup or after a
+`SIGHUP` reload.
+
+```yaml
+lan_hosts:
+  enabled: true
+  source: /var/dhcp.leases
+  domain: lan
+  include_unqualified: true
+  refresh_interval_secs: 60
+```
 
 ## Currently Supported Rule Syntax
 
@@ -242,6 +269,10 @@ Current hot reload support is limited to resolver and filtering changes such as:
 - `filtering.blocking_ipv4`
 - `filtering.blocking_ipv6`
 - `filtering.rewrites`
+- `lan_hosts`
+
+Lease file contents are also re-read when the catalog is rebuilt, including
+after a successful `SIGHUP` reload.
 
 Changes to listener or process-level settings such as listen addresses, port,
 TCP or UDP enablement, timeout, user, or group still require a full restart.

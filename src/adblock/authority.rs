@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
+    sync::{Arc, RwLock, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use hickory_proto::rr::{
     LowerName, Name, RData, Record, RecordSet, RecordType,
-    rdata::{A, AAAA, CNAME},
+    rdata::{A, AAAA, CNAME, PTR},
 };
 use hickory_server::{
     authority::{
@@ -18,22 +19,31 @@ use hickory_server::{
     proto::op::ResponseCode,
     server::RequestInfo,
 };
+use tokio::time::sleep;
 
+use super::rules::LanHostOverrides;
 use super::{
-    BlockingMode,
+    BlockingMode, LanHostsConfig,
     rules::{
         AnswerIpRewriteRule, CnameRewriteRule, CompiledMatchRule, DomainRewriteRule, OverrideRule,
-        TypeConstraint, domain_pattern_matches,
+        TypeConstraint, domain_pattern_matches, load_lan_host_overrides,
     },
 };
 
 pub struct OverrideAuthority {
     origin: LowerName,
     overrides: HashMap<LowerName, OverrideRule>,
+    ptr_overrides: HashMap<LowerName, Vec<Name>>,
+    lan_host_overrides: Option<LanHostOverrideSource>,
 }
 
 impl OverrideAuthority {
-    pub fn new(origin: Name, overrides: HashMap<String, OverrideRule>) -> Result<Self, String> {
+    pub fn new(
+        origin: Name,
+        overrides: HashMap<String, OverrideRule>,
+        ptr_overrides: HashMap<String, Vec<String>>,
+        lan_hosts: LanHostsConfig,
+    ) -> Result<Self, String> {
         let mut normalized = HashMap::new();
         for (domain, override_rule) in overrides {
             let mut name = Name::from_ascii(&domain)
@@ -42,10 +52,80 @@ impl OverrideAuthority {
             normalized.insert(LowerName::from(name), override_rule);
         }
 
+        let mut normalized_ptr = HashMap::new();
+        for (reverse_name, targets) in ptr_overrides {
+            let mut name = Name::from_ascii(&reverse_name)
+                .map_err(|err| format!("invalid PTR override name {reverse_name}: {err}"))?;
+            name.set_fqdn(true);
+
+            let targets = targets
+                .into_iter()
+                .map(|target| {
+                    let mut target_name = Name::from_ascii(&target)
+                        .map_err(|err| format!("invalid PTR override target {target}: {err}"))?;
+                    target_name.set_fqdn(true);
+                    Ok(target_name)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            normalized_ptr.insert(LowerName::from(name), targets);
+        }
+
         Ok(Self {
             origin: LowerName::from(origin),
             overrides: normalized,
+            ptr_overrides: normalized_ptr,
+            lan_host_overrides: LanHostOverrideSource::new(lan_hosts),
         })
+    }
+}
+
+#[derive(Clone)]
+struct LanHostOverrideSource {
+    cache: Arc<RwLock<LanHostOverrides>>,
+}
+
+impl LanHostOverrideSource {
+    fn new(config: LanHostsConfig) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+
+        let cache = Arc::new(RwLock::new(load_lan_host_overrides(&config)));
+        if config.refresh_interval_secs > 0 {
+            spawn_lan_host_refresh(cache.clone(), config);
+        }
+
+        Some(Self { cache })
+    }
+
+    fn with_cache<T>(&self, f: impl FnOnce(&LanHostOverrides) -> T) -> T {
+        let cache = self.cache.read().expect("LAN host override lock poisoned");
+        f(&cache)
+    }
+}
+
+fn spawn_lan_host_refresh(cache: Arc<RwLock<LanHostOverrides>>, config: LanHostsConfig) {
+    let weak_cache = Arc::downgrade(&cache);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            refresh_lan_host_cache_loop(weak_cache, config).await;
+        });
+    }
+}
+
+async fn refresh_lan_host_cache_loop(
+    weak_cache: Weak<RwLock<LanHostOverrides>>,
+    config: LanHostsConfig,
+) {
+    let interval = Duration::from_secs(config.refresh_interval_secs);
+    loop {
+        sleep(interval).await;
+        let Some(cache) = weak_cache.upgrade() else {
+            break;
+        };
+
+        *cache.write().expect("LAN host override lock poisoned") = load_lan_host_overrides(&config);
     }
 }
 
@@ -77,12 +157,30 @@ impl Authority for OverrideAuthority {
     ) -> LookupControlFlow<Self::Lookup> {
         use LookupControlFlow::{Break, Skip};
 
-        let Some(override_rule) = self.overrides.get(name) else {
-            return Skip;
-        };
+        if let Some(override_rule) = self.overrides.get(name) {
+            let records = override_lookup_records(name, override_rule, rtype, lookup_options);
+            return Break(Ok(records));
+        }
 
-        let records = override_lookup_records(name, override_rule, rtype, lookup_options);
-        Break(Ok(records))
+        let domain = normalized_query_name(name);
+        if let Some(records) = self.lan_host_overrides.as_ref().and_then(|leases| {
+            lan_host_override_lookup_records(leases, name, &domain, rtype, lookup_options)
+        }) {
+            return Break(Ok(records));
+        }
+
+        if let Some(ptr_targets) = self.ptr_overrides.get(name) {
+            let records = ptr_lookup_records(name, ptr_targets, rtype, lookup_options);
+            return Break(Ok(records));
+        }
+
+        if let Some(records) = self.lan_host_overrides.as_ref().and_then(|leases| {
+            lan_host_ptr_lookup_records(leases, name, &domain, rtype, lookup_options)
+        }) {
+            return Break(Ok(records));
+        }
+
+        Skip
     }
 
     async fn search(
@@ -495,6 +593,60 @@ fn override_lookup_records(
     AuthLookup::from(LookupRecords::many(lookup_options, record_sets))
 }
 
+fn ptr_lookup_records(
+    name: &LowerName,
+    targets: &[Name],
+    rtype: RecordType,
+    lookup_options: LookupOptions,
+) -> AuthLookup {
+    if !matches!(rtype, RecordType::PTR | RecordType::ANY) {
+        return AuthLookup::from(LookupRecords::default());
+    }
+
+    let mut set = RecordSet::with_ttl(Name::from(name), RecordType::PTR, 60);
+    for target in targets {
+        set.add_rdata(RData::PTR(PTR(target.clone())));
+    }
+
+    AuthLookup::from(LookupRecords::many(lookup_options, vec![Arc::new(set)]))
+}
+
+fn lan_host_override_lookup_records(
+    leases: &LanHostOverrideSource,
+    name: &LowerName,
+    domain: &str,
+    rtype: RecordType,
+    lookup_options: LookupOptions,
+) -> Option<AuthLookup> {
+    leases.with_cache(|cache| {
+        cache.overrides.get(domain).map(|override_rule| {
+            override_lookup_records(name, override_rule, rtype, lookup_options)
+        })
+    })
+}
+
+fn lan_host_ptr_lookup_records(
+    leases: &LanHostOverrideSource,
+    name: &LowerName,
+    domain: &str,
+    rtype: RecordType,
+    lookup_options: LookupOptions,
+) -> Option<AuthLookup> {
+    leases.with_cache(|cache| {
+        cache.ptr_overrides.get(domain).map(|targets| {
+            let targets = targets
+                .iter()
+                .filter_map(|target| {
+                    let mut name = Name::from_ascii(target).ok()?;
+                    name.set_fqdn(true);
+                    Some(name)
+                })
+                .collect::<Vec<_>>();
+            ptr_lookup_records(name, &targets, rtype, lookup_options)
+        })
+    })
+}
+
 fn block_lookup_records(
     name: &LowerName,
     rtype: RecordType,
@@ -602,5 +754,19 @@ mod tests {
             record_ip(&record),
             Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
         );
+    }
+
+    #[test]
+    fn ptr_lookup_records_return_ptr_targets() {
+        let name = LowerName::from(Name::from_ascii("4.3.2.1.in-addr.arpa.").unwrap());
+        let targets = vec![Name::from_ascii("host.lan.").unwrap()];
+        let lookup = ptr_lookup_records(&name, &targets, RecordType::PTR, LookupOptions::default());
+
+        let records: Vec<Record> = lookup.iter().cloned().collect();
+        assert_eq!(records.len(), 1);
+        match records[0].data() {
+            RData::PTR(PTR(target)) => assert_eq!(target, &targets[0]),
+            other => panic!("expected PTR record, got {other:?}"),
+        }
     }
 }

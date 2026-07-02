@@ -14,7 +14,7 @@ use hickory_server::{
     store::forwarder::{ForwardAuthority, ForwardConfig},
 };
 
-pub use config::{BlockingMode, FilterConfig, FilteringConfig};
+pub use config::{BlockingMode, FilterConfig, FilteringConfig, LanHostsConfig};
 pub use rules::{AdblockRuntimeConfig, CompiledRuleSets};
 
 use self::authority::{BlockAuthority, OverrideAuthority, RewriteAuthority};
@@ -50,11 +50,19 @@ fn override_authority(
     origin: Name,
     compiled: &CompiledRuleSets,
 ) -> Result<Option<Arc<dyn AuthorityObject>>, String> {
-    if compiled.overrides.is_empty() {
+    if compiled.overrides.is_empty()
+        && compiled.ptr_overrides.is_empty()
+        && !compiled.lan_hosts.enabled
+    {
         return Ok(None);
     }
 
-    let authority = OverrideAuthority::new(origin, compiled.overrides.clone())?;
+    let authority = OverrideAuthority::new(
+        origin,
+        compiled.overrides.clone(),
+        compiled.ptr_overrides.clone(),
+        compiled.lan_hosts.clone(),
+    )?;
     Ok(Some(Arc::new(authority)))
 }
 
@@ -110,8 +118,10 @@ pub fn is_adblock_enabled(
     filters: &[FilterConfig],
     user_rules: &[String],
     filtering: &FilteringConfig,
+    lan_hosts: &LanHostsConfig,
 ) -> bool {
     filters.iter().any(|filter| filter.enabled)
         || !user_rules.is_empty()
         || !filtering.rewrites.is_empty()
+        || lan_hosts.enabled
 }
