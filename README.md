@@ -92,6 +92,7 @@ The server supports these core DNS settings:
 - listen port
 - `log_level`
 - `filter_cache_dir`
+- `filter_refresh_interval_secs`
 - TCP / UDP enable or disable
 - TCP timeout
 - `External` zones
@@ -104,7 +105,14 @@ logs unless you explicitly opt in.
 `filter_cache_dir` controls where downloaded remote filter lists are cached.
 The default is `/tmp/astra-dns/filters-cache`, which keeps router deployments
 from writing these refreshes to flash unless you explicitly choose a persistent
-directory.
+directory. Cached lists are loaded without a network request during startup and
+`SIGHUP` reloads. A list is downloaded immediately only when no cache exists.
+
+`filter_refresh_interval_secs` controls scheduled remote filter refreshes and
+defaults to `86400` (one day). Set it to `0` to disable scheduled refreshes.
+Refreshes run while the existing DNS catalog continues serving requests; the
+new catalog replaces it only after loading completes. If a download fails, the
+cached list remains active.
 
 For a simple router-style forwarding setup, the server also supports a compact
 AdGuard Home-inspired syntax:
@@ -273,6 +281,10 @@ Current hot reload support is limited to resolver and filtering changes such as:
 
 Lease file contents are also re-read when the catalog is rebuilt, including
 after a successful `SIGHUP` reload.
+
+Remote filter cache files are also re-read on `SIGHUP`, but they are not
+downloaded again until `filter_refresh_interval_secs` elapses. A newly enabled
+filter with no cache is downloaded during its first load.
 
 Changes to listener or process-level settings such as listen addresses, port,
 TCP or UDP enablement, timeout, user, or group still require a full restart.

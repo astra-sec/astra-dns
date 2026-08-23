@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use super::{
     BlockingMode, FilterConfig, FilteringConfig, LanHostsConfig,
     config::{RewriteAnswerConfig, RewriteConfig},
-    fetch::{FilterFetchOptions, fetch_filter},
+    fetch::{FilterFetchMode, FilterFetchOptions, fetch_filter},
 };
 
 #[derive(Clone, Debug)]
@@ -128,7 +128,14 @@ enum RuleOrigin {
 
 impl CompiledRuleSets {
     pub async fn build(config: AdblockRuntimeConfig, _config_path: &Path) -> Result<Self, String> {
-        Self::build_with_fetch_mode(config, true).await
+        Self::build_with_fetch_mode(config, FilterFetchMode::CacheFirst).await
+    }
+
+    pub async fn refresh(
+        config: AdblockRuntimeConfig,
+        _config_path: &Path,
+    ) -> Result<Self, String> {
+        Self::build_with_fetch_mode(config, FilterFetchMode::Refresh).await
     }
 
     pub fn validate(config: AdblockRuntimeConfig) -> Result<Self, String> {
@@ -137,29 +144,29 @@ impl CompiledRuleSets {
 
     async fn build_with_fetch_mode(
         config: AdblockRuntimeConfig,
-        fetch_remote_filters: bool,
+        fetch_mode: FilterFetchMode,
     ) -> Result<Self, String> {
         let mut rules = RuleSets::default();
         let mut disabled_rules = HashSet::new();
-        let fetch_options =
-            fetch_remote_filters.then(|| FilterFetchOptions::new(config.filter_cache_dir.clone()));
+        let fetch_options = FilterFetchOptions::new(config.filter_cache_dir.clone());
 
         for filter in config.filters.iter().filter(|filter| filter.enabled) {
-            if let Some(fetch_options) = &fetch_options {
-                let contents = match fetch_filter(filter, fetch_options).await {
-                    Ok(contents) => contents,
-                    Err(err) => {
-                        warn!("{err}");
-                        continue;
+            let contents = match fetch_filter(filter, &fetch_options, fetch_mode).await {
+                Ok(contents) => contents,
+                Err(err) => {
+                    if fetch_mode == FilterFetchMode::Refresh {
+                        return Err(err);
                     }
-                };
-                parse_rule_lines(
-                    &contents,
-                    RuleOrigin::RemoteFilter,
-                    &mut rules,
-                    &mut disabled_rules,
-                )?;
-            }
+                    warn!("{err}");
+                    continue;
+                }
+            };
+            parse_rule_lines(
+                &contents,
+                RuleOrigin::RemoteFilter,
+                &mut rules,
+                &mut disabled_rules,
+            )?;
         }
 
         for line in &config.user_rules {

@@ -42,6 +42,7 @@ pub use prometheus_server::PrometheusServer;
 static DEFAULT_PORT: u16 = 53;
 static DEFAULT_TCP_REQUEST_TIMEOUT: u64 = 5;
 static DEFAULT_FILTER_CACHE_DIR: &str = "/tmp/astra-dns/filters-cache";
+static DEFAULT_FILTER_REFRESH_INTERVAL_SECS: u64 = 86_400;
 
 /// Server configuration
 #[derive(Deserialize, Debug)]
@@ -77,6 +78,8 @@ pub struct Config {
     log_level: Option<String>,
     /// Directory for downloaded remote filter list cache files.
     filter_cache_dir: Option<PathBuf>,
+    /// Interval for refreshing remote filter lists. Zero disables refreshes.
+    filter_refresh_interval_secs: Option<u64>,
     /// User to run the server as.
     ///
     /// Only supported on Unix-like platforms. When both user and group are set, the server will
@@ -219,6 +222,11 @@ impl Config {
         self.filter_cache_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_FILTER_CACHE_DIR))
+    }
+
+    pub fn filter_refresh_interval_secs(&self) -> u64 {
+        self.filter_refresh_interval_secs
+            .unwrap_or(DEFAULT_FILTER_REFRESH_INTERVAL_SECS)
     }
 
     pub fn adblock_runtime_config(&self) -> Option<AdblockRuntimeConfig> {
@@ -638,6 +646,16 @@ filters:
             runtime.filter_cache_dir,
             PathBuf::from("/mnt/storage/astra-dns/filters-cache")
         );
+    }
+
+    #[test]
+    fn filter_refresh_defaults_to_daily_and_can_be_disabled() {
+        let default_config = Config::from_yaml("").expect("config should parse");
+        assert_eq!(default_config.filter_refresh_interval_secs(), 86_400);
+
+        let disabled_config =
+            Config::from_yaml("filter_refresh_interval_secs: 0").expect("config should parse");
+        assert_eq!(disabled_config.filter_refresh_interval_secs(), 0);
     }
 
     #[test]

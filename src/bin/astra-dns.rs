@@ -19,14 +19,13 @@
 
 #![recursion_limit = "128"]
 
-#[cfg(feature = "metrics")]
-use std::time::Duration;
 use std::{
     fmt,
     io::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -39,11 +38,10 @@ use socket2::{Domain, Socket, Type};
 use time::OffsetDateTime;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
-#[cfg(feature = "metrics")]
-use tokio::time::sleep;
 use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
+    time::{Instant, sleep},
 };
 use tracing::{Event, Level, Subscriber, error, info};
 use tracing_subscriber::{
@@ -156,7 +154,7 @@ where
     let loaded = if args.validate {
         validate_runtime_config(config_path)?
     } else {
-        load_runtime_config(config_path).await?
+        load_runtime_config(config_path, FilterLoadMode::CacheFirst).await?
     };
     let config = loaded.config;
     update_log_level(&log_filter_handle, config.log_level())?;
@@ -297,6 +295,11 @@ where
         banner();
         info!("server starting up, awaiting connections...");
 
+        let filter_refresh_timer = sleep(filter_refresh_delay(
+            reload_settings.filter_refresh_interval_secs,
+        ));
+        tokio::pin!(filter_refresh_timer);
+
         loop {
             tokio::select! {
                 _ = terminate_signal.recv() => {
@@ -305,16 +308,48 @@ where
                     break;
                 }
                 _ = reload_signal.recv() => {
+                    let previous_refresh_interval =
+                        reload_settings.filter_refresh_interval_secs;
                     match reload_runtime_config(
                         config_path,
                         &args,
                         &handler,
                         &mut reload_settings,
                         &log_filter_handle,
+                        FilterLoadMode::CacheFirst,
                     ).await {
                         Ok(()) => info!("configuration reload completed"),
                         Err(err) => error!("configuration reload failed: {err}"),
                     }
+                    if previous_refresh_interval
+                        != reload_settings.filter_refresh_interval_secs
+                    {
+                        filter_refresh_timer.as_mut().reset(
+                            Instant::now() + filter_refresh_delay(
+                                reload_settings.filter_refresh_interval_secs,
+                            ),
+                        );
+                    }
+                }
+                _ = &mut filter_refresh_timer,
+                    if reload_settings.filter_refresh_interval_secs > 0 => {
+                    info!("remote filter refresh interval elapsed");
+                    match reload_runtime_config(
+                        config_path,
+                        &args,
+                        &handler,
+                        &mut reload_settings,
+                        &log_filter_handle,
+                        FilterLoadMode::Refresh,
+                    ).await {
+                        Ok(()) => info!("remote filter refresh completed"),
+                        Err(err) => error!("remote filter refresh failed: {err}"),
+                    }
+                    filter_refresh_timer.as_mut().reset(
+                        Instant::now() + filter_refresh_delay(
+                            reload_settings.filter_refresh_interval_secs,
+                        ),
+                    );
                 }
                 result = &mut server_task => {
                     let result = result.map_err(|err| format!("server task failed: {err}"))?;
@@ -374,10 +409,19 @@ struct RuntimeHandles {
     process_metrics_collector: tokio::task::JoinHandle<()>,
 }
 
-async fn load_runtime_config(config_path: &std::path::Path) -> Result<LoadedRuntimeConfig, String> {
+#[derive(Clone, Copy, Debug)]
+enum FilterLoadMode {
+    CacheFirst,
+    Refresh,
+}
+
+async fn load_runtime_config(
+    config_path: &std::path::Path,
+    filter_mode: FilterLoadMode,
+) -> Result<LoadedRuntimeConfig, String> {
     let config = Config::read_config(config_path)
         .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
-    let catalog = build_catalog(config_path, &config).await?;
+    let catalog = build_catalog(config_path, &config, filter_mode).await?;
     Ok(LoadedRuntimeConfig {
         config,
         catalog: Arc::new(catalog),
@@ -398,9 +442,20 @@ fn validate_runtime_config(config_path: &std::path::Path) -> Result<LoadedRuntim
     })
 }
 
-async fn build_catalog(config_path: &std::path::Path, config: &Config) -> Result<Catalog, String> {
+async fn build_catalog(
+    config_path: &std::path::Path,
+    config: &Config,
+    filter_mode: FilterLoadMode,
+) -> Result<Catalog, String> {
     let adblock_rules = match config.adblock_runtime_config() {
-        Some(runtime_config) => Some(CompiledRuleSets::build(runtime_config, config_path).await?),
+        Some(runtime_config) => Some(match filter_mode {
+            FilterLoadMode::CacheFirst => {
+                CompiledRuleSets::build(runtime_config, config_path).await?
+            }
+            FilterLoadMode::Refresh => {
+                CompiledRuleSets::refresh(runtime_config, config_path).await?
+            }
+        }),
         None => None,
     };
 
@@ -425,13 +480,14 @@ async fn reload_runtime_config<S>(
     handler: &ReloadableCatalog,
     active_settings: &mut ReloadSettings,
     log_filter_handle: &reload::Handle<EnvFilter, S>,
+    filter_mode: FilterLoadMode,
 ) -> Result<(), String>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
     info!("reloading configuration from {config_path:?}");
 
-    let loaded = load_runtime_config(config_path).await?;
+    let loaded = load_runtime_config(config_path, filter_mode).await?;
     let new_settings = ReloadSettings::from_effective_config(args, &loaded.config, config_path)?;
     active_settings.ensure_reload_safe(&new_settings)?;
     update_log_level(log_filter_handle, loaded.config.log_level())?;
@@ -534,6 +590,7 @@ struct ReloadSettings {
     tcp_request_timeout_secs: u64,
     user: Option<String>,
     group: Option<String>,
+    filter_refresh_interval_secs: u64,
 }
 
 impl ReloadSettings {
@@ -568,6 +625,7 @@ impl ReloadSettings {
             tcp_request_timeout_secs: config.tcp_request_timeout().as_secs(),
             user: config.user.clone(),
             group: config.group.clone(),
+            filter_refresh_interval_secs: config.filter_refresh_interval_secs(),
         })
     }
 
@@ -605,6 +663,10 @@ impl ReloadSettings {
             ))
         }
     }
+}
+
+fn filter_refresh_delay(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(1))
 }
 
 fn banner() {
