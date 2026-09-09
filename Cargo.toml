@@ -17,7 +17,7 @@ async-trait = "0.1"
 cfg-if = "1"
 clap = { version = "4.0", features = ["std", "derive"] }
 hickory-client = { version = "0.25.2" }
-hickory-resolver = { version = "0.25.2" }
+hickory-resolver = { version = "0.25.2", features = ["https-ring", "webpki-roots"] }
 hickory-server = { version = "0.25.2", features = ["resolver"] }
 hickory-proto = { version = "0.25.2", features = ["std"] }
 ipnet = { version = "2.3.0" }
@@ -31,3 +31,4 @@ time = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing = { version = "0.1.30" }
 tracing-subscriber = { version = "0.3", features = ["std", "env-filter"] }
+url = "2"

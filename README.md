@@ -24,6 +24,7 @@ logic in one place.
 pipeline built on Hickory DNS. The repository currently works as:
 
 - a forwarding DNS server
+- a DNS-over-HTTPS upstream client with TLS certificate validation
 - an ad-blocking DNS server for a focused subset of AdGuard Home-style rules
 - a Cloudflare-oriented DNS rewrite layer for best-IP style redirection
 - a small experimentation base for DNS filtering features
@@ -127,6 +128,32 @@ dns:
 That compact form is translated internally into a root `External` forward zone.
 Do not combine it with `zones` in the same config file.
 
+DNS-over-HTTPS upstreams use standard HTTPS URLs. Hostname endpoints are
+resolved through the system resolver only for the initial connection; TLS
+still verifies the hostname from the URL. To control that initial lookup,
+provide ordinary DNS resolver addresses through `bootstrap_ips`:
+
+```yaml
+dns:
+  upstream_dns:
+    - https://doh.cleanbrowsing.org/doh/security-filter/
+    - https://freedns.controld.com/p0
+  bootstrap_ips:
+    - 223.5.5.5
+    - 119.29.29.29
+  cache_size: 4096
+```
+
+`dns.bootstrap_ips` is shared by all domain-based DoH URLs in `upstream_dns`.
+These bootstrap queries use plaintext DNS only to discover the HTTPS server
+addresses; normal forwarded queries remain encrypted and verify each URL's TLS
+hostname. If `bootstrap_ips` is omitted, the system resolver performs the
+initial hostname lookups instead.
+
+A URL whose host is already an IP address can use the compact form directly,
+for example `https://1.1.1.1/dns-query`. DoH uses HTTP/2 with certificate
+validation and defaults to `/dns-query` when the URL has no explicit path.
+
 For ad-blocking, the server now imports a focused subset inspired by AdGuard
 Home:
 
@@ -229,7 +256,7 @@ Notably missing:
 - DHCP
 - full rewrite syntax from `config.all.yaml` beyond the currently implemented
   `domain`, wildcard-domain, `ip`, and `cname` patterns
-- complete DoH / DoT / DoQ product wiring
+- DoT / DoQ upstream wiring
 
 Some ABP-style rules are intentionally out of scope for now even if they can be
 parsed elsewhere in the ecosystem:
@@ -271,6 +298,7 @@ kill -HUP "$(pidof astra-dns)"
 Current hot reload support is limited to resolver and filtering changes such as:
 
 - `dns.upstream_dns`
+- `dns.bootstrap_ips`
 - `filters`
 - `user_rules`
 - `filtering.blocking_mode`

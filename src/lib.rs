@@ -22,11 +22,16 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
 use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
-use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup, ResolverOpts};
+use hickory_resolver::{
+    TokioResolver,
+    config::{NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts},
+    name_server::TokioConnectionProvider,
+};
 use hickory_server::authority::{AuthorityObject, ZoneType};
 use hickory_server::store::forwarder::ForwardAuthority;
 use hickory_server::store::forwarder::ForwardConfig;
 use tracing::{debug, info, warn};
+use url::{Host, Url};
 
 mod adblock;
 #[cfg(feature = "prometheus-metrics")]
@@ -273,6 +278,7 @@ impl Config {
 #[serde(default, deny_unknown_fields)]
 struct DnsConfig {
     upstream_dns: Vec<UpstreamDnsConfig>,
+    bootstrap_ips: Vec<IpAddr>,
     cache_size: Option<usize>,
     cache_ttl_min: Option<u64>,
     cache_ttl_max: Option<u64>,
@@ -287,15 +293,39 @@ enum UpstreamDnsConfig {
 }
 
 impl UpstreamDnsConfig {
-    fn into_name_server_config(self) -> Result<NameServerConfig, String> {
+    fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Address(address) => parse_upstream_dns_address(&address),
-            Self::Detailed(config) => Ok(config),
+            Self::Address(address) if address.contains("://") => {
+                if address.starts_with("udp://") || address.starts_with("tcp://") {
+                    parse_plain_upstream_dns_address(address).map(drop)
+                } else {
+                    parse_doh_endpoint(address).map(drop)
+                }
+            }
+            Self::Address(address) => parse_plain_upstream_dns_address(address).map(drop),
+            Self::Detailed(_) => Ok(()),
+        }
+    }
+
+    async fn resolve_name_server_configs(
+        &self,
+        bootstrap_ips: &[IpAddr],
+    ) -> Result<Vec<NameServerConfig>, String> {
+        match self {
+            Self::Address(address) if address.contains("://") => {
+                if address.starts_with("udp://") || address.starts_with("tcp://") {
+                    Ok(vec![parse_plain_upstream_dns_address(address)?])
+                } else {
+                    resolve_doh_endpoint(parse_doh_endpoint(address)?, bootstrap_ips).await
+                }
+            }
+            Self::Address(address) => Ok(vec![parse_plain_upstream_dns_address(address)?]),
+            Self::Detailed(config) => Ok(vec![config.clone()]),
         }
     }
 }
 
-fn parse_upstream_dns_address(address: &str) -> Result<NameServerConfig, String> {
+fn parse_plain_upstream_dns_address(address: &str) -> Result<NameServerConfig, String> {
     let (protocol, address) = if let Some(addr) = address.strip_prefix("udp://") {
         (Protocol::Udp, addr)
     } else if let Some(addr) = address.strip_prefix("tcp://") {
@@ -309,7 +339,7 @@ fn parse_upstream_dns_address(address: &str) -> Result<NameServerConfig, String>
         .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
         .map_err(|_| {
             format!(
-                "invalid upstream DNS address `{address}`; expected `IP`, `IP:PORT`, `udp://IP:PORT`, or `tcp://IP:PORT`"
+                "invalid upstream DNS address `{address}`; expected `IP`, `IP:PORT`, `udp://IP:PORT`, `tcp://IP:PORT`, or an HTTPS URL"
             )
         })?;
 
@@ -321,6 +351,165 @@ fn parse_upstream_dns_address(address: &str) -> Result<NameServerConfig, String>
         trust_negative_responses: false,
         bind_addr: None,
     })
+}
+
+#[derive(Debug)]
+struct DnsOverHttpsEndpoint {
+    tls_dns_name: String,
+    port: u16,
+    http_endpoint: String,
+}
+
+fn parse_doh_endpoint(address: &str) -> Result<DnsOverHttpsEndpoint, String> {
+    let url = Url::parse(address)
+        .map_err(|err| format!("invalid DNS-over-HTTPS URL `{address}`: {err}"))?;
+
+    if url.scheme() != "https" {
+        return Err(format!(
+            "unsupported upstream DNS URL scheme `{}` in `{address}`; only `https` is supported",
+            url.scheme()
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "DNS-over-HTTPS URL `{address}` must not contain user information"
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "DNS-over-HTTPS URL `{address}` must not contain a query string or fragment"
+        ));
+    }
+
+    let tls_dns_name = match url.host() {
+        Some(Host::Domain(domain)) => domain.to_owned(),
+        Some(Host::Ipv4(ip)) => ip.to_string(),
+        Some(Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err(format!("DNS-over-HTTPS URL `{address}` is missing a host")),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| format!("DNS-over-HTTPS URL `{address}` is missing a port"))?;
+    let http_endpoint = match url.path() {
+        "" | "/" => "/dns-query".to_owned(),
+        path => path.to_owned(),
+    };
+
+    Ok(DnsOverHttpsEndpoint {
+        tls_dns_name,
+        port,
+        http_endpoint,
+    })
+}
+
+async fn resolve_doh_endpoint(
+    endpoint: DnsOverHttpsEndpoint,
+    bootstrap_ips: &[IpAddr],
+) -> Result<Vec<NameServerConfig>, String> {
+    let DnsOverHttpsEndpoint {
+        tls_dns_name,
+        port,
+        http_endpoint,
+    } = endpoint;
+
+    let mut socket_addrs: Vec<SocketAddr> = if let Ok(ip) = tls_dns_name.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else if bootstrap_ips.is_empty() {
+        tokio::net::lookup_host((tls_dns_name.as_str(), port))
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to resolve DNS-over-HTTPS upstream `{tls_dns_name}`: {err}; configure `dns.bootstrap_ips` to avoid system DNS bootstrap"
+                )
+            })?
+            .collect()
+    } else {
+        resolve_with_bootstrap_dns(&tls_dns_name, bootstrap_ips)
+            .await?
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
+    };
+
+    socket_addrs.sort_unstable();
+    socket_addrs.dedup();
+    if socket_addrs.is_empty() {
+        return Err(format!(
+            "DNS-over-HTTPS upstream `{tls_dns_name}` resolved to no addresses"
+        ));
+    }
+
+    Ok(socket_addrs
+        .into_iter()
+        .map(|socket_addr| NameServerConfig {
+            socket_addr,
+            protocol: Protocol::Https,
+            tls_dns_name: Some(tls_dns_name.clone()),
+            http_endpoint: Some(http_endpoint.clone()),
+            trust_negative_responses: false,
+            bind_addr: None,
+        })
+        .collect())
+}
+
+async fn resolve_with_bootstrap_dns(
+    hostname: &str,
+    bootstrap_ips: &[IpAddr],
+) -> Result<impl Iterator<Item = IpAddr>, String> {
+    let name_servers = bootstrap_name_server_configs(bootstrap_ips);
+    let resolver = TokioResolver::builder_with_config(
+        ResolverConfig::from_parts(None, Vec::new(), NameServerConfigGroup::from(name_servers)),
+        TokioConnectionProvider::default(),
+    )
+    .build();
+    let lookup_name = format!("{hostname}.");
+    let lookup = resolver.lookup_ip(lookup_name).await.map_err(|err| {
+        format!(
+            "failed to resolve DNS-over-HTTPS upstream `{hostname}` using `dns.bootstrap_ips`: {err}"
+        )
+    })?;
+
+    Ok(lookup.into_iter())
+}
+
+fn bootstrap_name_server_configs(bootstrap_ips: &[IpAddr]) -> Vec<NameServerConfig> {
+    bootstrap_ips
+        .iter()
+        .copied()
+        .map(|ip| NameServerConfig {
+            socket_addr: SocketAddr::new(ip, 53),
+            protocol: Protocol::Udp,
+            tls_dns_name: None,
+            http_endpoint: None,
+            trust_negative_responses: false,
+            bind_addr: None,
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct CompactForwardConfig {
+    upstream_dns: Vec<UpstreamDnsConfig>,
+    bootstrap_ips: Vec<IpAddr>,
+    options: Option<ResolverOpts>,
+}
+
+impl CompactForwardConfig {
+    async fn resolve(&self) -> Result<ForwardConfig, String> {
+        let mut name_servers = Vec::new();
+        for upstream in &self.upstream_dns {
+            name_servers.extend(
+                upstream
+                    .resolve_name_server_configs(&self.bootstrap_ips)
+                    .await?,
+            );
+        }
+
+        Ok(ForwardConfig {
+            name_servers: NameServerConfigGroup::from(name_servers),
+            options: self.options.clone(),
+        })
+    }
 }
 
 /// Configuration for a zone
@@ -337,15 +526,15 @@ impl ZoneConfig {
     fn root_forward(dns: DnsConfig) -> Result<Self, String> {
         let DnsConfig {
             upstream_dns,
+            bootstrap_ips,
             cache_size,
             cache_ttl_min,
             cache_ttl_max,
         } = dns;
 
-        let name_servers: Vec<NameServerConfig> = upstream_dns
-            .into_iter()
-            .map(UpstreamDnsConfig::into_name_server_config)
-            .collect::<Result<_, _>>()?;
+        for upstream in &upstream_dns {
+            upstream.validate()?;
+        }
 
         let options = if cache_size.is_some() || cache_ttl_min.is_some() || cache_ttl_max.is_some()
         {
@@ -371,8 +560,9 @@ impl ZoneConfig {
         Ok(Self {
             zone: ".".to_owned(),
             zone_type_config: ZoneTypeConfig::External {
-                stores: vec![ExternalStoreConfig::Forward(ForwardConfig {
-                    name_servers: NameServerConfigGroup::from(name_servers),
+                stores: vec![ExternalStoreConfig::CompactForward(CompactForwardConfig {
+                    upstream_dns,
+                    bootstrap_ips,
                     options,
                 })],
             },
@@ -402,28 +592,23 @@ impl ZoneConfig {
                 );
 
                 for store in stores {
-                    let authority: Arc<dyn AuthorityObject> = match store {
-                        ExternalStoreConfig::Forward(config) => {
-                            if let Some(adblock_rules) = adblock_rules {
-                                let chained = adblock::build_authorities(
-                                    zone_name.clone(),
-                                    config.clone(),
-                                    adblock_rules,
-                                )?;
-                                authorities.extend(chained);
-                                continue;
-                            }
-
-                            let forwarder = ForwardAuthority::builder_tokio(config.clone())
-                                .with_origin(zone_name.clone())
-                                .build()?;
-
-                            Arc::new(forwarder)
-                        }
+                    let config = match store {
+                        ExternalStoreConfig::Forward(config) => config.clone(),
+                        ExternalStoreConfig::CompactForward(config) => config.resolve().await?,
                         ExternalStoreConfig::Default => return empty_stores_error(),
                     };
 
-                    authorities.push(authority);
+                    if let Some(adblock_rules) = adblock_rules {
+                        let chained =
+                            adblock::build_authorities(zone_name.clone(), config, adblock_rules)?;
+                        authorities.extend(chained);
+                        continue;
+                    }
+
+                    let forwarder = ForwardAuthority::builder_tokio(config)
+                        .with_origin(zone_name.clone())
+                        .build()?;
+                    authorities.push(Arc::new(forwarder));
                 }
             }
         }
@@ -471,6 +656,8 @@ pub enum ZoneTypeConfig {
 pub enum ExternalStoreConfig {
     /// Forwarding Resolver
     Forward(ForwardConfig),
+    #[serde(skip)]
+    CompactForward(CompactForwardConfig),
     /// This is used by the configuration processing code to represent a deprecated or main-block config without an associated store.
     #[default]
     Default,
@@ -524,8 +711,21 @@ where
 mod config_tests {
     use super::*;
 
-    #[test]
-    fn supports_adguard_style_upstream_dns() {
+    async fn resolved_forward_config(config: &Config) -> ForwardConfig {
+        match &config.zones[0].zone_type_config {
+            ZoneTypeConfig::External { stores } => match &stores[0] {
+                ExternalStoreConfig::CompactForward(config) => config
+                    .resolve()
+                    .await
+                    .expect("forward config should resolve"),
+                ExternalStoreConfig::Forward(config) => config.clone(),
+                ExternalStoreConfig::Default => panic!("expected a forward store"),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_adguard_style_upstream_dns() {
         let config = Config::from_yaml(
             r#"
 listen_addrs_ipv4: ["127.0.0.1"]
@@ -539,26 +739,16 @@ dns:
         assert_eq!(config.zones.len(), 1);
         assert_eq!(config.zones[0].zone, ".");
 
-        match &config.zones[0].zone_type_config {
-            ZoneTypeConfig::External { stores } => {
-                assert_eq!(stores.len(), 1);
-                match &stores[0] {
-                    #[cfg(feature = "resolver")]
-                    ExternalStoreConfig::Forward(config) => {
-                        assert_eq!(config.name_servers.len(), 1);
-                        let upstream = &config.name_servers[0];
-                        assert_eq!(upstream.socket_addr, "127.0.0.1:7874".parse().unwrap());
-                        assert_eq!(upstream.protocol, Protocol::Udp);
-                        assert!(!upstream.trust_negative_responses);
-                    }
-                    _ => panic!("expected a forward store"),
-                }
-            }
-        }
+        let forward = resolved_forward_config(&config).await;
+        assert_eq!(forward.name_servers.len(), 1);
+        let upstream = &forward.name_servers[0];
+        assert_eq!(upstream.socket_addr, "127.0.0.1:7874".parse().unwrap());
+        assert_eq!(upstream.protocol, Protocol::Udp);
+        assert!(!upstream.trust_negative_responses);
     }
 
-    #[test]
-    fn upstream_dns_defaults_port_53() {
+    #[tokio::test]
+    async fn upstream_dns_defaults_port_53() {
         let config = Config::from_yaml(
             r#"
 dns:
@@ -568,22 +758,15 @@ dns:
         )
         .expect("config should parse");
 
-        match &config.zones[0].zone_type_config {
-            ZoneTypeConfig::External { stores } => match &stores[0] {
-                #[cfg(feature = "resolver")]
-                ExternalStoreConfig::Forward(config) => {
-                    assert_eq!(
-                        config.name_servers[0].socket_addr,
-                        "8.8.8.8:53".parse().unwrap()
-                    );
-                }
-                _ => panic!("expected a forward store"),
-            },
-        }
+        let forward = resolved_forward_config(&config).await;
+        assert_eq!(
+            forward.name_servers[0].socket_addr,
+            "8.8.8.8:53".parse().unwrap()
+        );
     }
 
-    #[test]
-    fn supports_adguard_style_cache_options() {
+    #[tokio::test]
+    async fn supports_adguard_style_cache_options() {
         let config = Config::from_yaml(
             r#"
 dns:
@@ -596,22 +779,111 @@ dns:
         )
         .expect("config should parse");
 
-        match &config.zones[0].zone_type_config {
+        let forward = resolved_forward_config(&config).await;
+        let options = forward
+            .options
+            .as_ref()
+            .expect("resolver options should exist");
+        assert_eq!(options.cache_size, 1024);
+        assert_eq!(options.positive_min_ttl, Some(Duration::from_secs(30)));
+        assert_eq!(options.negative_min_ttl, Some(Duration::from_secs(30)));
+        assert_eq!(options.positive_max_ttl, Some(Duration::from_secs(600)));
+        assert_eq!(options.negative_max_ttl, Some(Duration::from_secs(600)));
+    }
+
+    #[tokio::test]
+    async fn supports_doh_with_bootstrap_ips() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - https://doh.cleanbrowsing.org/doh/security-filter/
+    - https://freedns.controld.com/p0
+  bootstrap_ips:
+    - 223.5.5.5
+    - 119.29.29.29
+"#,
+        )
+        .expect("config should parse");
+
+        let compact = match &config.zones[0].zone_type_config {
             ZoneTypeConfig::External { stores } => match &stores[0] {
-                #[cfg(feature = "resolver")]
-                ExternalStoreConfig::Forward(config) => {
-                    let options = config
-                        .options
-                        .as_ref()
-                        .expect("resolver options should exist");
-                    assert_eq!(options.cache_size, 1024);
-                    assert_eq!(options.positive_min_ttl, Some(Duration::from_secs(30)));
-                    assert_eq!(options.negative_min_ttl, Some(Duration::from_secs(30)));
-                    assert_eq!(options.positive_max_ttl, Some(Duration::from_secs(600)));
-                    assert_eq!(options.negative_max_ttl, Some(Duration::from_secs(600)));
-                }
-                _ => panic!("expected a forward store"),
+                ExternalStoreConfig::CompactForward(config) => config,
+                _ => panic!("expected a compact forward store"),
             },
+        };
+        assert_eq!(compact.upstream_dns.len(), 2);
+        assert_eq!(
+            compact.bootstrap_ips,
+            [
+                "223.5.5.5".parse::<IpAddr>().unwrap(),
+                "119.29.29.29".parse::<IpAddr>().unwrap()
+            ]
+        );
+
+        let bootstrap = bootstrap_name_server_configs(&compact.bootstrap_ips);
+        assert_eq!(bootstrap.len(), 2);
+        assert_eq!(bootstrap[0].socket_addr, "223.5.5.5:53".parse().unwrap());
+        assert_eq!(bootstrap[1].socket_addr, "119.29.29.29:53".parse().unwrap());
+        assert!(
+            bootstrap
+                .iter()
+                .all(|server| server.protocol == Protocol::Udp)
+        );
+    }
+
+    #[tokio::test]
+    async fn supports_compact_doh_url_with_ip_host() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - https://1.1.1.1
+  bootstrap_ips:
+    - 9.9.9.9
+"#,
+        )
+        .expect("config should parse");
+
+        let forward = resolved_forward_config(&config).await;
+        let upstream = &forward.name_servers[0];
+        assert_eq!(upstream.socket_addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(upstream.protocol, Protocol::Https);
+        assert_eq!(upstream.tls_dns_name.as_deref(), Some("1.1.1.1"));
+        assert_eq!(upstream.http_endpoint.as_deref(), Some("/dns-query"));
+    }
+
+    #[tokio::test]
+    async fn resolves_compact_doh_hostname_at_runtime() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - https://localhost/dns-query
+"#,
+        )
+        .expect("config should parse without a bootstrap lookup");
+
+        let forward = resolved_forward_config(&config).await;
+        assert!(!forward.name_servers.is_empty());
+        for upstream in forward.name_servers.iter() {
+            assert_eq!(upstream.protocol, Protocol::Https);
+            assert_eq!(upstream.tls_dns_name.as_deref(), Some("localhost"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_doh_urls() {
+        for upstream in [
+            "http://doh.example/dns-query",
+            "https://user@doh.example/dns-query",
+            "https://doh.example/dns-query?format=json",
+        ] {
+            let yaml = format!("dns:\n  upstream_dns:\n    - {upstream}\n");
+            assert!(
+                Config::from_yaml(&yaml).is_err(),
+                "upstream should be rejected: {upstream}"
+            );
         }
     }
 
