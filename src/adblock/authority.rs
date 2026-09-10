@@ -26,7 +26,7 @@ use super::{
     BlockingMode, LanHostsConfig,
     rules::{
         AnswerIpRewriteRule, CnameRewriteRule, CompiledMatchRule, DomainRewriteRule, OverrideRule,
-        TypeConstraint, domain_pattern_matches, load_lan_host_overrides,
+        TypeConstraint, domain_pattern_matches, domain_set_matches, load_lan_host_overrides,
     },
 };
 
@@ -275,19 +275,11 @@ impl BlockAuthority {
     }
 
     fn matches_allowlist(&self, domain: &str) -> bool {
-        self.allow_exact.contains(domain)
-            || self
-                .allow_subdomains
-                .iter()
-                .any(|suffix| suffix_match(domain, suffix))
+        domain_set_matches(&self.allow_exact, &self.allow_subdomains, domain)
     }
 
     fn matches_blocklist(&self, domain: &str) -> bool {
-        self.block_exact.contains(domain)
-            || self
-                .block_subdomains
-                .iter()
-                .any(|suffix| suffix_match(domain, suffix))
+        domain_set_matches(&self.block_exact, &self.block_subdomains, domain)
     }
 
     fn matches_rule_list(
@@ -701,13 +693,6 @@ fn record_cname(record: &Record) -> Option<String> {
     }
 }
 
-fn suffix_match(domain: &str, suffix: &str) -> bool {
-    domain == suffix
-        || domain
-            .strip_suffix(suffix)
-            .is_some_and(|prefix| prefix.ends_with('.'))
-}
-
 fn rule_allows_type(rule: &CompiledMatchRule, rtype: RecordType) -> bool {
     match &rule.dnstypes {
         None => true,
@@ -735,13 +720,6 @@ fn complex_rule_matches(rule: &CompiledMatchRule, domain: &str, rtype: RecordTyp
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn suffix_matching_requires_label_boundary() {
-        assert!(suffix_match("ads.example.com", "example.com"));
-        assert!(suffix_match("example.com", "example.com"));
-        assert!(!suffix_match("badexample.com", "example.com"));
-    }
 
     #[test]
     fn extracts_record_ip() {

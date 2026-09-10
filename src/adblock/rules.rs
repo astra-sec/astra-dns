@@ -752,11 +752,29 @@ fn remove_domain_rule(
 }
 
 fn is_allowed(domain: &str, rules: &RuleSets) -> bool {
-    rules.allow_exact.contains(domain)
-        || rules
-            .allow_subdomains
-            .iter()
-            .any(|suffix| suffix_match(domain, suffix))
+    domain_set_matches(&rules.allow_exact, &rules.allow_subdomains, domain)
+}
+
+pub(super) fn domain_set_matches(
+    exact: &HashSet<String>,
+    subdomains: &HashSet<String>,
+    domain: &str,
+) -> bool {
+    if exact.contains(domain) {
+        return true;
+    }
+
+    let mut candidate = domain;
+    loop {
+        if subdomains.contains(candidate) {
+            return true;
+        }
+
+        let Some(dot) = candidate.find('.') else {
+            return false;
+        };
+        candidate = &candidate[dot + 1..];
+    }
 }
 
 fn suffix_match(domain: &str, suffix: &str) -> bool {
@@ -1000,6 +1018,28 @@ mod tests {
 
         assert!(!rules.block_exact.contains("video.example.com"));
         assert!(rules.allow_subdomains.contains("video.example.com"));
+    }
+
+    #[test]
+    fn indexed_domain_matching_preserves_exact_and_suffix_semantics() {
+        let exact = HashSet::from(["exact.example.com".to_string()]);
+        let subdomains = HashSet::from(["ads.example.com".to_string(), "localhost".to_string()]);
+
+        for (domain, expected) in [
+            ("exact.example.com", true),
+            ("child.exact.example.com", false),
+            ("ads.example.com", true),
+            ("cdn.ads.example.com", true),
+            ("badads.example.com", false),
+            ("localhost", true),
+            ("child.localhost", true),
+            ("example.net", false),
+        ] {
+            let linear_scan = exact.contains(domain)
+                || subdomains.iter().any(|suffix| suffix_match(domain, suffix));
+            assert_eq!(domain_set_matches(&exact, &subdomains, domain), expected);
+            assert_eq!(domain_set_matches(&exact, &subdomains, domain), linear_scan);
+        }
     }
 
     #[test]

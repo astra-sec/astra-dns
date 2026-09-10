@@ -32,3 +32,10 @@ tokio = { version = "1", features = ["full"] }
 tracing = { version = "0.1.30" }
 tracing-subscriber = { version = "0.3", features = ["std", "env-filter"] }
 url = "2"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "domain_matching"
+harness = false
