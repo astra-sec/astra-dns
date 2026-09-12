@@ -267,6 +267,8 @@ parsed elsewhere in the ecosystem:
 
 ## How To Run
 
+Requires Rust 1.88 or newer (Hickory DNS 0.26.3).
+
 Build and run:
 
 ```bash

@@ -21,15 +21,15 @@ use std::{
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{self, Deserialize, Deserializer};
 
-use hickory_proto::{ProtoError, rr::Name, xfer::Protocol};
+use hickory_proto::{ProtoError, rr::Name};
 use hickory_resolver::{
     TokioResolver,
-    config::{NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts},
-    name_server::TokioConnectionProvider,
+    config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
 };
-use hickory_server::authority::{AuthorityObject, ZoneType};
-use hickory_server::store::forwarder::ForwardAuthority;
 use hickory_server::store::forwarder::ForwardConfig;
+use hickory_server::store::forwarder::ForwardZoneHandler;
+use hickory_server::zone_handler::{ZoneHandler, ZoneType};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
@@ -279,7 +279,7 @@ impl Config {
 struct DnsConfig {
     upstream_dns: Vec<UpstreamDnsConfig>,
     bootstrap_ips: Vec<IpAddr>,
-    cache_size: Option<usize>,
+    cache_size: Option<u64>,
     cache_ttl_min: Option<u64>,
     cache_ttl_max: Option<u64>,
 }
@@ -288,8 +288,83 @@ struct DnsConfig {
 #[serde(untagged)]
 enum UpstreamDnsConfig {
     Address(String),
-    #[cfg(feature = "resolver")]
-    Detailed(NameServerConfig),
+    Detailed(#[serde(deserialize_with = "deserialize_name_server")] NameServerConfig),
+}
+
+// Keep the pre-0.26 YAML shape usable while translating it to connection configs.
+fn deserialize_name_server<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<NameServerConfig, D::Error> {
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum LegacyProtocol {
+        #[default]
+        Udp,
+        Tcp,
+        Tls,
+        Https,
+    }
+    #[derive(Deserialize)]
+    struct Legacy {
+        socket_addr: SocketAddr,
+        #[serde(default)]
+        protocol: LegacyProtocol,
+        tls_dns_name: Option<String>,
+        http_endpoint: Option<String>,
+        #[serde(default)]
+        trust_negative_responses: bool,
+        bind_addr: Option<SocketAddr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compatible {
+        Legacy(Legacy),
+        Current(NameServerConfig),
+    }
+    let legacy = match Compatible::deserialize(deserializer)? {
+        Compatible::Current(config) => return Ok(config),
+        Compatible::Legacy(config) => config,
+    };
+    let server_name = legacy
+        .tls_dns_name
+        .unwrap_or_else(|| legacy.socket_addr.ip().to_string())
+        .into();
+    let mut connection = match legacy.protocol {
+        LegacyProtocol::Udp => ConnectionConfig::udp(),
+        LegacyProtocol::Tcp => ConnectionConfig::tcp(),
+        LegacyProtocol::Tls => ConnectionConfig::tls(server_name),
+        LegacyProtocol::Https => {
+            ConnectionConfig::https(server_name, legacy.http_endpoint.map(Into::into))
+        }
+    };
+    connection.port = legacy.socket_addr.port();
+    connection.bind_addr = legacy.bind_addr;
+    Ok(NameServerConfig::new(
+        legacy.socket_addr.ip(),
+        legacy.trust_negative_responses,
+        vec![connection],
+    ))
+}
+
+fn deserialize_forward_config<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ForwardConfig, D::Error> {
+    #[derive(Deserialize)]
+    struct Server(#[serde(deserialize_with = "deserialize_name_server")] NameServerConfig);
+    #[derive(Deserialize)]
+    struct Config {
+        name_servers: Vec<Server>,
+        options: Option<ResolverOpts>,
+    }
+    let config = Config::deserialize(deserializer)?;
+    Ok(ForwardConfig {
+        name_servers: config
+            .name_servers
+            .into_iter()
+            .map(|server| server.0)
+            .collect(),
+        options: config.options,
+    })
 }
 
 impl UpstreamDnsConfig {
@@ -327,11 +402,11 @@ impl UpstreamDnsConfig {
 
 fn parse_plain_upstream_dns_address(address: &str) -> Result<NameServerConfig, String> {
     let (protocol, address) = if let Some(addr) = address.strip_prefix("udp://") {
-        (Protocol::Udp, addr)
+        (ProtocolConfig::Udp, addr)
     } else if let Some(addr) = address.strip_prefix("tcp://") {
-        (Protocol::Tcp, addr)
+        (ProtocolConfig::Tcp, addr)
     } else {
-        (Protocol::Udp, address)
+        (ProtocolConfig::Udp, address)
     };
 
     let socket_addr = address
@@ -343,14 +418,13 @@ fn parse_plain_upstream_dns_address(address: &str) -> Result<NameServerConfig, S
             )
         })?;
 
-    Ok(NameServerConfig {
-        socket_addr,
-        protocol,
-        tls_dns_name: None,
-        http_endpoint: None,
-        trust_negative_responses: false,
-        bind_addr: None,
-    })
+    let mut connection = ConnectionConfig::new(protocol);
+    connection.port = socket_addr.port();
+    Ok(NameServerConfig::new(
+        socket_addr.ip(),
+        false,
+        vec![connection],
+    ))
 }
 
 #[derive(Debug)]
@@ -440,13 +514,13 @@ async fn resolve_doh_endpoint(
 
     Ok(socket_addrs
         .into_iter()
-        .map(|socket_addr| NameServerConfig {
-            socket_addr,
-            protocol: Protocol::Https,
-            tls_dns_name: Some(tls_dns_name.clone()),
-            http_endpoint: Some(http_endpoint.clone()),
-            trust_negative_responses: false,
-            bind_addr: None,
+        .map(|socket_addr| {
+            let mut connection = ConnectionConfig::https(
+                tls_dns_name.clone().into(),
+                Some(http_endpoint.clone().into()),
+            );
+            connection.port = socket_addr.port();
+            NameServerConfig::new(socket_addr.ip(), false, vec![connection])
         })
         .collect())
 }
@@ -457,10 +531,11 @@ async fn resolve_with_bootstrap_dns(
 ) -> Result<impl Iterator<Item = IpAddr>, String> {
     let name_servers = bootstrap_name_server_configs(bootstrap_ips);
     let resolver = TokioResolver::builder_with_config(
-        ResolverConfig::from_parts(None, Vec::new(), NameServerConfigGroup::from(name_servers)),
-        TokioConnectionProvider::default(),
+        ResolverConfig::from_name_servers(name_servers),
+        TokioRuntimeProvider::default(),
     )
-    .build();
+    .build()
+    .map_err(|err| format!("failed to build bootstrap DNS resolver: {err}"))?;
     let lookup_name = format!("{hostname}.");
     let lookup = resolver.lookup_ip(lookup_name).await.map_err(|err| {
         format!(
@@ -475,14 +550,7 @@ fn bootstrap_name_server_configs(bootstrap_ips: &[IpAddr]) -> Vec<NameServerConf
     bootstrap_ips
         .iter()
         .copied()
-        .map(|ip| NameServerConfig {
-            socket_addr: SocketAddr::new(ip, 53),
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            http_endpoint: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        })
+        .map(|ip| NameServerConfig::new(ip, false, vec![ConnectionConfig::udp()]))
         .collect()
 }
 
@@ -506,7 +574,7 @@ impl CompactForwardConfig {
         }
 
         Ok(ForwardConfig {
-            name_servers: NameServerConfigGroup::from(name_servers),
+            name_servers,
             options: self.options.clone(),
         })
     }
@@ -573,7 +641,7 @@ impl ZoneConfig {
     pub async fn load(
         &self,
         adblock_rules: Option<&CompiledRuleSets>,
-    ) -> Result<Vec<Arc<dyn AuthorityObject>>, String> {
+    ) -> Result<Vec<Arc<dyn ZoneHandler>>, String> {
         debug!("loading zone with config: {self:#?}");
 
         let zone_name = self
@@ -582,7 +650,7 @@ impl ZoneConfig {
 
         // load the zone and insert any configured authorities in the catalog.
 
-        let mut authorities: Vec<Arc<dyn AuthorityObject>> = vec![];
+        let mut authorities: Vec<Arc<dyn ZoneHandler>> = vec![];
 
         match &self.zone_type_config {
             ZoneTypeConfig::External { stores } => {
@@ -605,7 +673,7 @@ impl ZoneConfig {
                         continue;
                     }
 
-                    let forwarder = ForwardAuthority::builder_tokio(config)
+                    let forwarder = ForwardZoneHandler::builder_tokio(config)
                         .with_origin(zone_name.clone())
                         .build()?;
                     authorities.push(Arc::new(forwarder));
@@ -613,7 +681,7 @@ impl ZoneConfig {
             }
         }
 
-        info!("zone successfully loaded: {}", self.zone()?);
+        info!("zone successfully loaded: {zone_name}");
         Ok(authorities)
     }
 
@@ -655,7 +723,7 @@ pub enum ZoneTypeConfig {
 #[non_exhaustive]
 pub enum ExternalStoreConfig {
     /// Forwarding Resolver
-    Forward(ForwardConfig),
+    Forward(#[serde(deserialize_with = "deserialize_forward_config")] ForwardConfig),
     #[serde(skip)]
     CompactForward(CompactForwardConfig),
     /// This is used by the configuration processing code to represent a deprecated or main-block config without an associated store.
@@ -742,8 +810,12 @@ dns:
         let forward = resolved_forward_config(&config).await;
         assert_eq!(forward.name_servers.len(), 1);
         let upstream = &forward.name_servers[0];
-        assert_eq!(upstream.socket_addr, "127.0.0.1:7874".parse().unwrap());
-        assert_eq!(upstream.protocol, Protocol::Udp);
+        assert_eq!(upstream.ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(upstream.connections[0].port, 7874);
+        assert!(matches!(
+            upstream.connections[0].protocol,
+            ProtocolConfig::Udp
+        ));
         assert!(!upstream.trust_negative_responses);
     }
 
@@ -760,9 +832,10 @@ dns:
 
         let forward = resolved_forward_config(&config).await;
         assert_eq!(
-            forward.name_servers[0].socket_addr,
-            "8.8.8.8:53".parse().unwrap()
+            forward.name_servers[0].ip,
+            "8.8.8.8".parse::<IpAddr>().unwrap()
         );
+        assert_eq!(forward.name_servers[0].connections[0].port, 53);
     }
 
     #[tokio::test]
@@ -823,12 +896,13 @@ dns:
 
         let bootstrap = bootstrap_name_server_configs(&compact.bootstrap_ips);
         assert_eq!(bootstrap.len(), 2);
-        assert_eq!(bootstrap[0].socket_addr, "223.5.5.5:53".parse().unwrap());
-        assert_eq!(bootstrap[1].socket_addr, "119.29.29.29:53".parse().unwrap());
+        assert_eq!(bootstrap[0].ip, "223.5.5.5".parse::<IpAddr>().unwrap());
+        assert_eq!(bootstrap[1].ip, "119.29.29.29".parse::<IpAddr>().unwrap());
         assert!(
             bootstrap
                 .iter()
-                .all(|server| server.protocol == Protocol::Udp)
+                .all(|server| server.connections[0].port == 53
+                    && matches!(server.connections[0].protocol, ProtocolConfig::Udp))
         );
     }
 
@@ -847,10 +921,11 @@ dns:
 
         let forward = resolved_forward_config(&config).await;
         let upstream = &forward.name_servers[0];
-        assert_eq!(upstream.socket_addr, "1.1.1.1:443".parse().unwrap());
-        assert_eq!(upstream.protocol, Protocol::Https);
-        assert_eq!(upstream.tls_dns_name.as_deref(), Some("1.1.1.1"));
-        assert_eq!(upstream.http_endpoint.as_deref(), Some("/dns-query"));
+        assert_eq!(upstream.ip, "1.1.1.1".parse::<IpAddr>().unwrap());
+        assert_eq!(upstream.connections[0].port, 443);
+        assert!(matches!(&upstream.connections[0].protocol,
+            ProtocolConfig::Https { server_name, path }
+            if server_name.as_ref() == "1.1.1.1" && path.as_ref() == "/dns-query"));
     }
 
     #[tokio::test]
@@ -867,8 +942,8 @@ dns:
         let forward = resolved_forward_config(&config).await;
         assert!(!forward.name_servers.is_empty());
         for upstream in forward.name_servers.iter() {
-            assert_eq!(upstream.protocol, Protocol::Https);
-            assert_eq!(upstream.tls_dns_name.as_deref(), Some("localhost"));
+            assert!(matches!(&upstream.connections[0].protocol,
+                ProtocolConfig::Https { server_name, .. } if server_name.as_ref() == "localhost"));
         }
     }
 
@@ -963,5 +1038,84 @@ zones:
             err.to_string()
                 .contains("cannot configure both `zones` and `dns.upstream_dns`")
         );
+    }
+    #[tokio::test]
+    async fn preserves_legacy_detailed_upstreams() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - socket_addr: "192.0.2.1:8443"
+      protocol: https
+      tls_dns_name: dns.example
+      http_endpoint: /custom-query
+      bind_addr: "127.0.0.1:0"
+      trust_negative_responses: true
+    - socket_addr: "[::1]:5353"
+      protocol: tcp
+"#,
+        )
+        .unwrap();
+        let forward = resolved_forward_config(&config).await;
+        let server = &forward.name_servers[0];
+        assert!(server.trust_negative_responses);
+        assert_eq!(server.ip, "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert_eq!(server.connections[0].port, 8443);
+        assert_eq!(
+            server.connections[0].bind_addr,
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        assert!(matches!(&server.connections[0].protocol,
+            ProtocolConfig::Https { server_name, path }
+            if server_name.as_ref() == "dns.example" && path.as_ref() == "/custom-query"));
+        let server = &forward.name_servers[1];
+        assert!(!server.trust_negative_responses);
+        assert_eq!(server.connections[0].port, 5353);
+        assert!(matches!(
+            server.connections[0].protocol,
+            ProtocolConfig::Tcp
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserves_legacy_zone_forward_store() {
+        let config = Config::from_yaml(
+            r#"
+zones:
+  - zone: "."
+    zone_type: External
+    stores:
+      type: forward
+      name_servers:
+        - socket_addr: "127.0.0.1:5353"
+"#,
+        )
+        .unwrap();
+        let forward = resolved_forward_config(&config).await;
+        assert_eq!(forward.name_servers[0].connections[0].port, 5353);
+        assert!(!forward.name_servers[0].trust_negative_responses);
+        assert!(matches!(
+            forward.name_servers[0].connections[0].protocol,
+            ProtocolConfig::Udp
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserves_doh_ipv6_port_and_path() {
+        let config = Config::from_yaml(
+            r#"
+dns:
+  upstream_dns:
+    - https://[::1]:8443/custom-query
+"#,
+        )
+        .unwrap();
+        let forward = resolved_forward_config(&config).await;
+        let server = &forward.name_servers[0];
+        assert_eq!(server.ip, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(server.connections[0].port, 8443);
+        assert!(matches!(&server.connections[0].protocol,
+            ProtocolConfig::Https { server_name, path }
+            if server_name.as_ref() == "::1" && path.as_ref() == "/custom-query"));
     }
 }

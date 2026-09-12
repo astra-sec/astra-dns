@@ -10,8 +10,8 @@ use std::{
 
 use hickory_proto::rr::Name;
 use hickory_server::{
-    authority::AuthorityObject,
-    store::forwarder::{ForwardAuthority, ForwardConfig},
+    store::forwarder::{ForwardConfig, ForwardZoneHandler},
+    zone_handler::ZoneHandler,
 };
 
 pub use config::{BlockingMode, FilterConfig, FilteringConfig, LanHostsConfig};
@@ -23,8 +23,8 @@ pub fn build_authorities(
     origin: Name,
     forward_config: ForwardConfig,
     compiled: &CompiledRuleSets,
-) -> Result<Vec<Arc<dyn AuthorityObject>>, String> {
-    let mut authorities: Vec<Arc<dyn AuthorityObject>> = Vec::new();
+) -> Result<Vec<Arc<dyn ZoneHandler>>, String> {
+    let mut authorities: Vec<Arc<dyn ZoneHandler>> = Vec::new();
 
     if let Some(authority) = override_authority(origin.clone(), compiled)? {
         authorities.push(authority);
@@ -38,7 +38,7 @@ pub fn build_authorities(
         authorities.push(authority);
     }
 
-    let forwarder = ForwardAuthority::builder_tokio(forward_config)
+    let forwarder = ForwardZoneHandler::builder_tokio(forward_config)
         .with_origin(origin)
         .build()?;
     authorities.push(Arc::new(forwarder));
@@ -49,7 +49,7 @@ pub fn build_authorities(
 fn override_authority(
     origin: Name,
     compiled: &CompiledRuleSets,
-) -> Result<Option<Arc<dyn AuthorityObject>>, String> {
+) -> Result<Option<Arc<dyn ZoneHandler>>, String> {
     if compiled.overrides.is_empty()
         && compiled.ptr_overrides.is_empty()
         && !compiled.lan_hosts.enabled
@@ -69,7 +69,7 @@ fn override_authority(
 fn block_authority(
     origin: Name,
     compiled: &CompiledRuleSets,
-) -> Result<Option<Arc<dyn AuthorityObject>>, String> {
+) -> Result<Option<Arc<dyn ZoneHandler>>, String> {
     if compiled.block_exact.is_empty()
         && compiled.block_subdomains.is_empty()
         && compiled.block_rules.is_empty()
@@ -97,7 +97,7 @@ fn block_authority(
 fn rewrite_authority(
     origin: Name,
     compiled: &CompiledRuleSets,
-) -> Result<Option<Arc<dyn AuthorityObject>>, String> {
+) -> Result<Option<Arc<dyn ZoneHandler>>, String> {
     if compiled.domain_rewrites.is_empty()
         && compiled.answer_ip_rewrites.is_empty()
         && compiled.cname_rewrites.is_empty()

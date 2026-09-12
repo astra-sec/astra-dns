@@ -8,16 +8,16 @@ use std::{
 
 use async_trait::async_trait;
 use hickory_proto::rr::{
-    LowerName, Name, RData, Record, RecordSet, RecordType,
+    LowerName, Name, RData, Record, RecordSet, RecordType, TSigResponseContext,
     rdata::{A, AAAA, CNAME, PTR},
 };
 use hickory_server::{
-    authority::{
-        AuthLookup, Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions,
-        LookupRecords, MessageRequest, UpdateResult, ZoneType,
-    },
     proto::op::ResponseCode,
-    server::RequestInfo,
+    server::{Request, RequestInfo},
+    zone_handler::{
+        AuthLookup, AxfrPolicy, LookupControlFlow, LookupError, LookupOptions, LookupRecords,
+        ZoneHandler, ZoneType,
+    },
 };
 use tokio::time::sleep;
 
@@ -130,19 +130,13 @@ async fn refresh_lan_host_cache_loop(
 }
 
 #[async_trait]
-impl Authority for OverrideAuthority {
-    type Lookup = AuthLookup;
-
+impl ZoneHandler for OverrideAuthority {
     fn zone_type(&self) -> ZoneType {
         ZoneType::External
     }
 
-    fn is_axfr_allowed(&self) -> bool {
-        false
-    }
-
-    async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
-        Err(ResponseCode::NotImp)
+    fn axfr_policy(&self) -> AxfrPolicy {
+        AxfrPolicy::Deny
     }
 
     fn origin(&self) -> &LowerName {
@@ -153,8 +147,9 @@ impl Authority for OverrideAuthority {
         &self,
         name: &LowerName,
         rtype: RecordType,
+        _request_info: Option<&RequestInfo<'_>>,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         use LookupControlFlow::{Break, Skip};
 
         if let Some(override_rule) = self.overrides.get(name) {
@@ -185,22 +180,30 @@ impl Authority for OverrideAuthority {
 
     async fn search(
         &self,
-        request_info: RequestInfo<'_>,
+        request: &Request,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
-        self.lookup(
-            request_info.query.name(),
-            request_info.query.query_type(),
-            lookup_options,
+    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        let request_info = match request.request_info() {
+            Ok(info) => info,
+            Err(err) => return (LookupControlFlow::Break(Err(err)), None),
+        };
+        (
+            self.lookup(
+                request_info.query.name(),
+                request_info.query.query_type(),
+                Some(&request_info),
+                lookup_options,
+            )
+            .await,
+            None,
         )
-        .await
     }
 
-    async fn get_nsec_records(
+    async fn nsec_records(
         &self,
         _name: &LowerName,
         _lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         LookupControlFlow::Continue(Err(LookupError::from(io::Error::other(
             "Getting NSEC records is unimplemented for overrides",
         ))))
@@ -321,19 +324,13 @@ impl BlockAuthority {
 }
 
 #[async_trait]
-impl Authority for BlockAuthority {
-    type Lookup = AuthLookup;
-
+impl ZoneHandler for BlockAuthority {
     fn zone_type(&self) -> ZoneType {
         ZoneType::External
     }
 
-    fn is_axfr_allowed(&self) -> bool {
-        false
-    }
-
-    async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
-        Err(ResponseCode::NotImp)
+    fn axfr_policy(&self) -> AxfrPolicy {
+        AxfrPolicy::Deny
     }
 
     fn origin(&self) -> &LowerName {
@@ -344,8 +341,9 @@ impl Authority for BlockAuthority {
         &self,
         name: &LowerName,
         rtype: RecordType,
+        _request_info: Option<&RequestInfo<'_>>,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         use LookupControlFlow::Skip;
 
         let domain = normalized_query_name(name);
@@ -371,22 +369,30 @@ impl Authority for BlockAuthority {
 
     async fn search(
         &self,
-        request_info: RequestInfo<'_>,
+        request: &Request,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
-        self.lookup(
-            request_info.query.name(),
-            request_info.query.query_type(),
-            lookup_options,
+    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        let request_info = match request.request_info() {
+            Ok(info) => info,
+            Err(err) => return (LookupControlFlow::Break(Err(err)), None),
+        };
+        (
+            self.lookup(
+                request_info.query.name(),
+                request_info.query.query_type(),
+                Some(&request_info),
+                lookup_options,
+            )
+            .await,
+            None,
         )
-        .await
     }
 
-    async fn get_nsec_records(
+    async fn nsec_records(
         &self,
         _name: &LowerName,
         _lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         LookupControlFlow::Continue(Err(LookupError::from(io::Error::other(
             "Getting NSEC records is unimplemented for the blocklist",
         ))))
@@ -417,19 +423,13 @@ impl BlockAuthority {
 }
 
 #[async_trait]
-impl Authority for RewriteAuthority {
-    type Lookup = AuthLookup;
-
+impl ZoneHandler for RewriteAuthority {
     fn zone_type(&self) -> ZoneType {
         ZoneType::External
     }
 
-    fn is_axfr_allowed(&self) -> bool {
-        false
-    }
-
-    async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
-        Err(ResponseCode::NotImp)
+    fn axfr_policy(&self) -> AxfrPolicy {
+        AxfrPolicy::Deny
     }
 
     fn origin(&self) -> &LowerName {
@@ -440,8 +440,9 @@ impl Authority for RewriteAuthority {
         &self,
         name: &LowerName,
         rtype: RecordType,
+        _request_info: Option<&RequestInfo<'_>>,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         use LookupControlFlow::{Break, Skip};
 
         let domain = normalized_query_name(name);
@@ -465,59 +466,74 @@ impl Authority for RewriteAuthority {
         &self,
         name: &LowerName,
         rtype: RecordType,
+        _request_info: Option<&RequestInfo<'_>>,
         lookup_options: LookupOptions,
-        last_result: LookupControlFlow<Box<dyn LookupObject>>,
-    ) -> LookupControlFlow<Box<dyn LookupObject>> {
+        last_result: LookupControlFlow<AuthLookup>,
+    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
         use LookupControlFlow::{Break, Continue};
 
         let lookup = match last_result {
             Break(Ok(lookup)) | Continue(Ok(lookup)) => lookup,
-            Break(Err(err)) => return Break(Err(err)),
-            Continue(Err(err)) => return Continue(Err(err)),
-            LookupControlFlow::Skip => return LookupControlFlow::Skip,
+            Break(Err(err)) => return (Break(Err(err)), None),
+            Continue(Err(err)) => return (Continue(Err(err)), None),
+            LookupControlFlow::Skip => return (LookupControlFlow::Skip, None),
         };
 
         let records: Vec<Record> = lookup.iter().cloned().collect();
 
         if let Some(rule) = self.match_answer_ip_rewrite(&records) {
-            return Break(Ok(Box::new(override_lookup_records(
-                name,
-                &rule.answer,
-                rtype,
-                lookup_options,
-            ))));
+            return (
+                Break(Ok(override_lookup_records(
+                    name,
+                    &rule.answer,
+                    rtype,
+                    lookup_options,
+                ))),
+                None,
+            );
         }
 
         if let Some(rule) = self.match_cname_rewrite(&records) {
-            return Break(Ok(Box::new(override_lookup_records(
-                name,
-                &rule.answer,
-                rtype,
-                lookup_options,
-            ))));
+            return (
+                Break(Ok(override_lookup_records(
+                    name,
+                    &rule.answer,
+                    rtype,
+                    lookup_options,
+                ))),
+                None,
+            );
         }
 
-        Continue(Ok(lookup))
+        (Continue(Ok(lookup)), None)
     }
 
     async fn search(
         &self,
-        request_info: RequestInfo<'_>,
+        request: &Request,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
-        self.lookup(
-            request_info.query.name(),
-            request_info.query.query_type(),
-            lookup_options,
+    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        let request_info = match request.request_info() {
+            Ok(info) => info,
+            Err(err) => return (LookupControlFlow::Break(Err(err)), None),
+        };
+        (
+            self.lookup(
+                request_info.query.name(),
+                request_info.query.query_type(),
+                Some(&request_info),
+                lookup_options,
+            )
+            .await,
+            None,
         )
-        .await
     }
 
-    async fn get_nsec_records(
+    async fn nsec_records(
         &self,
         _name: &LowerName,
         _lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         LookupControlFlow::Continue(Err(LookupError::from(io::Error::other(
             "Getting NSEC records is unimplemented for rewrites",
         ))))
@@ -677,7 +693,7 @@ fn normalized_query_name(name: &LowerName) -> String {
 }
 
 fn record_ip(record: &Record) -> Option<IpAddr> {
-    match record.data() {
+    match &record.data {
         RData::A(A(ipv4)) => Some(IpAddr::V4(*ipv4)),
         RData::AAAA(AAAA(ipv6)) => Some(IpAddr::V6(*ipv6)),
         _ => None,
@@ -685,7 +701,7 @@ fn record_ip(record: &Record) -> Option<IpAddr> {
 }
 
 fn record_cname(record: &Record) -> Option<String> {
-    match record.data() {
+    match &record.data {
         RData::CNAME(CNAME(target)) => {
             Some(target.to_ascii().trim_end_matches('.').to_ascii_lowercase())
         }
@@ -742,7 +758,7 @@ mod tests {
 
         let records: Vec<Record> = lookup.iter().cloned().collect();
         assert_eq!(records.len(), 1);
-        match records[0].data() {
+        match &records[0].data {
             RData::PTR(PTR(target)) => assert_eq!(target, &targets[0]),
             other => panic!("expected PTR record, got {other:?}"),
         }

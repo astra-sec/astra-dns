@@ -60,8 +60,8 @@ use astra_dns::{CompiledRuleSets, Config};
 #[cfg(feature = "metrics")]
 use astra_dns::{ExternalStoreConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{
-    authority::Catalog,
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture},
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo, Server},
+    zone_handler::Catalog,
 };
 
 /// Cli struct for all options managed with clap derive api.
@@ -158,7 +158,7 @@ where
     };
     let config = loaded.config;
     update_log_level(&log_filter_handle, config.log_level())?;
-    info!("Hickory DNS {} starting...", hickory_client::version());
+    info!("Hickory DNS {} starting...", hickory_server::version());
     info!("loading configuration from: {config_path:?}");
     let mut reload_settings = ReloadSettings::from_effective_config(&args, &config, config_path)?;
     #[cfg(feature = "prometheus-metrics")]
@@ -226,7 +226,7 @@ where
 
     // now, run the server, based on the config
     let handler = ReloadableCatalog::new(loaded.catalog.clone());
-    let mut server = ServerFuture::new(handler.clone());
+    let mut server = Server::new(handler.clone());
 
     if !config.disable_udp() {
         // load all udp listeners
@@ -264,7 +264,7 @@ where
                     .map_err(|err| format!("failed to lookup local address: {err}"))?
             );
 
-            server.register_listener(tcp_listener, tcp_request_timeout);
+            server.register_listener(tcp_listener, tcp_request_timeout, 32);
         }
     } else {
         info!("TCP protocol is disabled");
@@ -375,15 +375,15 @@ where
 }
 
 async fn finish_server_run(
-    result: Result<(), hickory_proto::ProtoError>,
+    result: Result<(), hickory_server::net::NetError>,
     #[allow(unused_variables)] runtime_handles: RuntimeHandles,
 ) -> Result<(), String> {
     match result {
-        Ok(()) => info!("Hickory DNS {} stopping", hickory_client::version()),
+        Ok(()) => info!("Hickory DNS {} stopping", hickory_server::version()),
         Err(e) => {
             let error_msg = format!(
                 "Hickory DNS {} has encountered an error: {}",
-                hickory_client::version(),
+                hickory_server::version(),
                 e
             );
             error!("{error_msg}");
@@ -567,7 +567,7 @@ impl ReloadableCatalog {
 
 #[async_trait]
 impl RequestHandler for ReloadableCatalog {
-    async fn handle_request<R: ResponseHandler>(
+    async fn handle_request<R: ResponseHandler, T: hickory_server::net::runtime::Time>(
         &self,
         request: &Request,
         response_handle: R,
@@ -577,7 +577,9 @@ impl RequestHandler for ReloadableCatalog {
             .read()
             .expect("reloadable catalog lock poisoned")
             .clone();
-        catalog.handle_request(request, response_handle).await
+        catalog
+            .handle_request::<R, T>(request, response_handle)
+            .await
     }
 }
 
@@ -752,7 +754,7 @@ struct ConfigMetrics {
 #[cfg(feature = "metrics")]
 impl ConfigMetrics {
     fn new(config: &Config) -> Self {
-        let hickory_info = gauge!("hickory_info", "version" => hickory_client::version());
+        let hickory_info = gauge!("hickory_info", "version" => hickory_server::version());
         describe_gauge!("hickory_info", Unit::Count, "hickory service metadata");
         hickory_info.set(1);
 
