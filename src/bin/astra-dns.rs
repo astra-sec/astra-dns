@@ -41,6 +41,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
+    task::JoinSet,
     time::{Instant, sleep},
 };
 use tracing::{Event, Level, Subscriber, error, info};
@@ -240,6 +241,8 @@ where
     // now, run the server, based on the config
     let handler = ReloadableCatalog::new(loaded.catalog.clone());
     let mut server = Server::new(handler.clone());
+    let shutdown_token = server.shutdown_token().clone();
+    let mut listeners = JoinSet::new();
 
     if !config.disable_udp() {
         // load all udp listeners
@@ -256,6 +259,20 @@ where
                     .map_err(|err| format!("failed to lookup local address: {err}"))?
             );
 
+            #[cfg(target_os = "linux")]
+            {
+                let listener = astra_dns::udp::UdpListener::new(udp_socket)
+                    .map_err(|err| format!("failed to enable UDP packet information: {err}"))?;
+                let handler = handler.clone();
+                let shutdown = shutdown_token.clone();
+                listeners.spawn(async move {
+                    listener
+                        .run(handler, async move { shutdown.cancelled().await })
+                        .await
+                        .map_err(hickory_server::net::NetError::from)
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
             server.register_socket(udp_socket);
         }
     } else {
@@ -301,8 +318,33 @@ where
     }
 
     {
-        let shutdown_token = server.shutdown_token().clone();
-        let mut server_task = tokio::spawn(async move { server.block_until_done().await });
+        // On Linux UDP has its own transport, but all listeners share the same
+        // lifetime. Do not call an empty Hickory server in UDP-only mode, and do
+        // not leave TCP running with a silently dead UDP listener.
+        if !config.disable_tcp() || (cfg!(not(target_os = "linux")) && !config.disable_udp()) {
+            listeners.spawn(async move { server.block_until_done().await });
+        }
+        let listener_shutdown = shutdown_token.clone();
+        let mut server_task = tokio::spawn(async move {
+            while let Some(result) = listeners.join_next().await {
+                let result = result.unwrap_or_else(|err| {
+                    Err(hickory_server::net::NetError::from(format!(
+                        "listener task failed: {err}"
+                    )))
+                });
+                if let Err(error) = result {
+                    listener_shutdown.cancel();
+                    return Err(error);
+                }
+                if !listener_shutdown.is_cancelled() {
+                    listener_shutdown.cancel();
+                    return Err(hickory_server::net::NetError::from(
+                        "DNS listener stopped unexpectedly",
+                    ));
+                }
+            }
+            Ok(())
+        });
 
         banner();
         info!("server starting up, awaiting connections...");

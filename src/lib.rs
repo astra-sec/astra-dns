@@ -36,6 +36,8 @@ use url::{Host, Url};
 mod adblock;
 #[cfg(feature = "prometheus-metrics")]
 mod prometheus_server;
+#[cfg(target_os = "linux")]
+pub mod udp;
 mod upstream;
 
 pub use adblock::{

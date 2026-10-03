@@ -75,7 +75,9 @@ dns:
         .unwrap();
         let log = fs::File::create(directory.join("server.log")).unwrap();
         drop(reservation);
-        let child = Command::new(env!("CARGO_BIN_EXE_astra-dns"))
+        let executable = std::env::var_os("ASTRA_DNS_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_astra-dns").into());
+        let child = Command::new(executable)
             .args(["--workers", "2", "--config"])
             .arg(config)
             .env("NO_PROXY", "127.0.0.1,localhost")

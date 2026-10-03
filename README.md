@@ -31,7 +31,7 @@ pipeline built on Hickory DNS. The repository currently works as:
 
 With the default example config in [named.yaml](./named.yaml), the server:
 
-- listens on `0.0.0.0:8053`
+- listens on `0.0.0.0:5553` and `[::]:5553`
 - accepts both UDP and TCP DNS queries
 - defines the root zone `.`
 - forwards all queries to `8.8.8.8:53`
@@ -57,6 +57,8 @@ The main runtime is still Hickory-based:
 - [src/bin/astra-dns.rs](./src/bin/astra-dns.rs): CLI entrypoint, Tokio
   runtime, config loading, server startup
 - [src/lib.rs](./src/lib.rs): config schema and zone/store loading
+- [src/udp](./src/udp): Linux packet-aware UDP ingress; replies retain each
+  datagram's local destination address across wildcard listeners and NAT
 
 The ad-blocking logic is intentionally split into its own module tree:
 
@@ -98,6 +100,24 @@ The server supports these core DNS settings:
 - TCP timeout
 - `External` zones
 - `forward` stores
+
+To accept queries over both IP families, configure both listeners:
+
+```yaml
+listen_addrs_ipv4: ["0.0.0.0"]
+listen_addrs_ipv6: ["::"]
+listen_port: 5553
+```
+
+On Linux, including OpenWrt, UDP replies preserve each request's received local
+address and interface using packet information. This also works when IPv6 ULA
+and public addresses coexist: firewall REDIRECT can reverse its address and
+port translation correctly. No public IPv6 address needs to be hardcoded.
+Other operating systems retain the standard Hickory UDP transport; the Linux
+packet-information behavior is not promised there. TCP transport is unchanged.
+Existing configuration files are not automatically rewritten. When redirecting
+both IPv4 and IPv6 DNS, both address families must have a listener. Hosts with
+IPv6 disabled in the kernel should omit the IPv6 listener.
 
 `log_level` supports `Trace`, `Debug`, `Info`, `Warn`, and `Error`.
 The default is `Warn` so normal router deployments do not spam per-query `INFO`
