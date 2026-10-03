@@ -16,7 +16,7 @@ const DEFAULT_FILTER_READ_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterFetchMode {
-    CacheFirst,
+    CacheOnly,
     Refresh,
 }
 
@@ -45,6 +45,10 @@ impl FilterFetchOptions {
 
         self.cache_dir.join(format!("{cache_key}.txt"))
     }
+
+    pub fn is_cached(&self, filter: &FilterConfig) -> bool {
+        fs::read_to_string(self.cache_path_for(filter)).is_ok()
+    }
 }
 
 pub async fn fetch_filter(
@@ -54,7 +58,7 @@ pub async fn fetch_filter(
 ) -> Result<String, String> {
     let cache_path = options.cache_path_for(filter);
 
-    if mode == FilterFetchMode::CacheFirst
+    if mode == FilterFetchMode::CacheOnly
         && let Ok(contents) = fs::read_to_string(&cache_path)
     {
         info!(
@@ -62,6 +66,13 @@ pub async fn fetch_filter(
             filter.url, cache_path
         );
         return Ok(contents);
+    }
+
+    if mode == FilterFetchMode::CacheOnly {
+        return Err(format!(
+            "filter {} has no readable cache; download deferred until after DNS startup",
+            filter.url
+        ));
     }
 
     match download_filter_body(filter, options.connect_timeout, options.read_timeout).await {
@@ -153,7 +164,34 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cache_first_does_not_contact_remote_server() {
+    async fn missing_cache_does_not_contact_remote_server_at_startup() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let options = FilterFetchOptions::new(std::env::temp_dir().join(format!(
+            "astra-dns-missing-cache-{}-{unique}",
+            std::process::id()
+        )));
+        let filter = FilterConfig {
+            enabled: true,
+            url: format!("http://{}/filter.txt", listener.local_addr().unwrap()),
+            name: None,
+            id: Some(7),
+        };
+        assert!(!options.is_cached(&filter));
+        assert!(
+            fetch_filter(&filter, &options, FilterFetchMode::CacheOnly)
+                .await
+                .is_err()
+        );
+        assert!(matches!(listener.accept(), Err(err) if err.kind() == ErrorKind::WouldBlock));
+    }
+
+    #[tokio::test]
+    async fn cache_only_does_not_contact_remote_server() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
         listener
             .set_nonblocking(true)
@@ -177,7 +215,7 @@ mod tests {
         fs::create_dir_all(&cache_dir).expect("cache directory should be created");
         fs::write(&cache_path, "cached rule\n").expect("cached filter should be written");
 
-        let contents = fetch_filter(&filter, &options, FilterFetchMode::CacheFirst)
+        let contents = fetch_filter(&filter, &options, FilterFetchMode::CacheOnly)
             .await
             .expect("cached filter should load");
 

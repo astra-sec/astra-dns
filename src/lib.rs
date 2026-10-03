@@ -36,6 +36,7 @@ use url::{Host, Url};
 mod adblock;
 #[cfg(feature = "prometheus-metrics")]
 mod prometheus_server;
+mod upstream;
 
 pub use adblock::{
     AdblockRuntimeConfig, BlockingMode, CompiledRuleSets, FilterConfig, FilteringConfig,
@@ -427,7 +428,7 @@ fn parse_plain_upstream_dns_address(address: &str) -> Result<NameServerConfig, S
     ))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DnsOverHttpsEndpoint {
     tls_dns_name: String,
     port: u16,
@@ -512,17 +513,31 @@ async fn resolve_doh_endpoint(
         ));
     }
 
-    Ok(socket_addrs
+    Ok(doh_name_server_configs(
+        DnsOverHttpsEndpoint {
+            tls_dns_name,
+            port,
+            http_endpoint,
+        },
+        socket_addrs.into_iter().map(|addr| addr.ip()).collect(),
+    ))
+}
+
+fn doh_name_server_configs(
+    endpoint: DnsOverHttpsEndpoint,
+    addresses: Vec<IpAddr>,
+) -> Vec<NameServerConfig> {
+    addresses
         .into_iter()
-        .map(|socket_addr| {
+        .map(|ip| {
             let mut connection = ConnectionConfig::https(
-                tls_dns_name.clone().into(),
-                Some(http_endpoint.clone().into()),
+                endpoint.tls_dns_name.clone().into(),
+                Some(endpoint.http_endpoint.clone().into()),
             );
-            connection.port = socket_addr.port();
-            NameServerConfig::new(socket_addr.ip(), false, vec![connection])
+            connection.port = endpoint.port;
+            NameServerConfig::new(ip, false, vec![connection])
         })
-        .collect())
+        .collect()
 }
 
 async fn resolve_with_bootstrap_dns(
@@ -563,6 +578,7 @@ pub struct CompactForwardConfig {
 }
 
 impl CompactForwardConfig {
+    #[cfg(test)]
     async fn resolve(&self) -> Result<ForwardConfig, String> {
         let mut name_servers = Vec::new();
         for upstream in &self.upstream_dns {
@@ -660,23 +676,29 @@ impl ZoneConfig {
                 );
 
                 for store in stores {
-                    let config = match store {
-                        ExternalStoreConfig::Forward(config) => config.clone(),
-                        ExternalStoreConfig::CompactForward(config) => config.resolve().await?,
+                    let forwarder: Arc<dyn ZoneHandler> = match store {
+                        ExternalStoreConfig::Forward(config) => Arc::new(
+                            ForwardZoneHandler::builder_tokio(config.clone())
+                                .with_origin(zone_name.clone())
+                                .build()?,
+                        ),
+                        ExternalStoreConfig::CompactForward(config) => {
+                            upstream::RecoveringForwarder::shared(zone_name.clone(), config)?
+                        }
                         ExternalStoreConfig::Default => return empty_stores_error(),
                     };
 
                     if let Some(adblock_rules) = adblock_rules {
-                        let chained =
-                            adblock::build_authorities(zone_name.clone(), config, adblock_rules)?;
+                        let chained = adblock::build_authorities(
+                            zone_name.clone(),
+                            forwarder,
+                            adblock_rules,
+                        )?;
                         authorities.extend(chained);
                         continue;
                     }
 
-                    let forwarder = ForwardZoneHandler::builder_tokio(config)
-                        .with_origin(zone_name.clone())
-                        .build()?;
-                    authorities.push(Arc::new(forwarder));
+                    authorities.push(forwarder);
                 }
             }
         }

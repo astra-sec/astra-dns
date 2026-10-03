@@ -9,10 +9,7 @@ use std::{
 };
 
 use hickory_proto::rr::Name;
-use hickory_server::{
-    store::forwarder::{ForwardConfig, ForwardZoneHandler},
-    zone_handler::ZoneHandler,
-};
+use hickory_server::zone_handler::ZoneHandler;
 
 pub use config::{BlockingMode, FilterConfig, FilteringConfig, LanHostsConfig};
 pub use rules::{AdblockRuntimeConfig, CompiledRuleSets};
@@ -21,7 +18,7 @@ use self::authority::{BlockAuthority, OverrideAuthority, RewriteAuthority};
 
 pub fn build_authorities(
     origin: Name,
-    forward_config: ForwardConfig,
+    forwarder: Arc<dyn ZoneHandler>,
     compiled: &CompiledRuleSets,
 ) -> Result<Vec<Arc<dyn ZoneHandler>>, String> {
     let mut authorities: Vec<Arc<dyn ZoneHandler>> = Vec::new();
@@ -38,10 +35,7 @@ pub fn build_authorities(
         authorities.push(authority);
     }
 
-    let forwarder = ForwardZoneHandler::builder_tokio(forward_config)
-        .with_origin(origin)
-        .build()?;
-    authorities.push(Arc::new(forwarder));
+    authorities.push(forwarder);
 
     Ok(authorities)
 }

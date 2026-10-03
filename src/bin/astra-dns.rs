@@ -103,6 +103,17 @@ struct Cli {
     disable_prometheus: bool,
 }
 
+// Keep the serving/filter-refresh loop shared on platforms without SIGHUP.
+#[cfg(not(unix))]
+struct UnavailableSignal;
+
+#[cfg(not(unix))]
+impl UnavailableSignal {
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
+}
+
 /// Main method for running the named server.
 fn main() -> Result<(), String> {
     // this is essential for custom formatting the returned error message.
@@ -207,6 +218,8 @@ where
     #[cfg(unix)]
     let mut reload_signal = signal(SignalKind::hangup())
         .map_err(|e| format!("failed to register signal handler: {e}"))?;
+    #[cfg(not(unix))]
+    let (mut terminate_signal, mut reload_signal) = (UnavailableSignal, UnavailableSignal);
 
     let runtime_handles = RuntimeHandles {
         #[cfg(feature = "prometheus-metrics")]
@@ -287,7 +300,6 @@ where
         return Err("dropping privileges is only supported on Unix systems".to_string());
     }
 
-    #[cfg(unix)]
     {
         let shutdown_token = server.shutdown_token().clone();
         let mut server_task = tokio::spawn(async move { server.block_until_done().await });
@@ -295,9 +307,8 @@ where
         banner();
         info!("server starting up, awaiting connections...");
 
-        let filter_refresh_timer = sleep(filter_refresh_delay(
-            reload_settings.filter_refresh_interval_secs,
-        ));
+        let mut filter_retry_secs = 1;
+        let filter_refresh_timer = sleep(reload_settings.next_filter_refresh(filter_retry_secs));
         tokio::pin!(filter_refresh_timer);
 
         loop {
@@ -308,8 +319,6 @@ where
                     break;
                 }
                 _ = reload_signal.recv() => {
-                    let previous_refresh_interval =
-                        reload_settings.filter_refresh_interval_secs;
                     match reload_runtime_config(
                         config_path,
                         &args,
@@ -321,19 +330,15 @@ where
                         Ok(()) => info!("configuration reload completed"),
                         Err(err) => error!("configuration reload failed: {err}"),
                     }
-                    if previous_refresh_interval
-                        != reload_settings.filter_refresh_interval_secs
-                    {
-                        filter_refresh_timer.as_mut().reset(
-                            Instant::now() + filter_refresh_delay(
-                                reload_settings.filter_refresh_interval_secs,
-                            ),
-                        );
-                    }
+                    filter_retry_secs = 1;
+                    filter_refresh_timer.as_mut().reset(
+                        Instant::now() + reload_settings.next_filter_refresh(filter_retry_secs),
+                    );
                 }
                 _ = &mut filter_refresh_timer,
-                    if reload_settings.filter_refresh_interval_secs > 0 => {
-                    info!("remote filter refresh interval elapsed");
+                    if reload_settings.missing_filter_cache
+                        || reload_settings.filter_refresh_interval_secs > 0 => {
+                    info!("refreshing remote filters in background while DNS continues serving");
                     match reload_runtime_config(
                         config_path,
                         &args,
@@ -342,13 +347,17 @@ where
                         &log_filter_handle,
                         FilterLoadMode::Refresh,
                     ).await {
-                        Ok(()) => info!("remote filter refresh completed"),
-                        Err(err) => error!("remote filter refresh failed: {err}"),
+                        Ok(()) => {
+                            filter_retry_secs = 1;
+                            info!("remote filter refresh completed");
+                        }
+                        Err(err) => {
+                            filter_retry_secs = (filter_retry_secs * 2).min(30);
+                            error!("remote filter refresh failed; existing rules remain active: {err}");
+                        }
                     }
                     filter_refresh_timer.as_mut().reset(
-                        Instant::now() + filter_refresh_delay(
-                            reload_settings.filter_refresh_interval_secs,
-                        ),
+                        Instant::now() + reload_settings.next_filter_refresh(filter_retry_secs),
                     );
                 }
                 result = &mut server_task => {
@@ -363,15 +372,6 @@ where
             .map_err(|err| format!("server task failed: {err}"))?;
         finish_server_run(result, runtime_handles).await
     }
-
-    #[cfg(not(unix))]
-    banner();
-    #[cfg(not(unix))]
-    info!("server starting up, awaiting connections...");
-    #[cfg(not(unix))]
-    let result = server.block_until_done().await;
-    #[cfg(not(unix))]
-    finish_server_run(result, runtime_handles).await
 }
 
 async fn finish_server_run(
@@ -593,6 +593,7 @@ struct ReloadSettings {
     user: Option<String>,
     group: Option<String>,
     filter_refresh_interval_secs: u64,
+    missing_filter_cache: bool,
 }
 
 impl ReloadSettings {
@@ -628,6 +629,18 @@ impl ReloadSettings {
             user: config.user.clone(),
             group: config.group.clone(),
             filter_refresh_interval_secs: config.filter_refresh_interval_secs(),
+            missing_filter_cache: config
+                .adblock_runtime_config()
+                .as_ref()
+                .is_some_and(CompiledRuleSets::has_uncached_filters),
+        })
+    }
+
+    fn next_filter_refresh(&self, retry_secs: u64) -> Duration {
+        filter_refresh_delay(if self.missing_filter_cache {
+            retry_secs
+        } else {
+            self.filter_refresh_interval_secs
         })
     }
 

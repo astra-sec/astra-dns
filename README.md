@@ -106,8 +106,10 @@ logs unless you explicitly opt in.
 `filter_cache_dir` controls where downloaded remote filter lists are cached.
 The default is `/tmp/astra-dns/filters-cache`, which keeps router deployments
 from writing these refreshes to flash unless you explicitly choose a persistent
-directory. Cached lists are loaded without a network request during startup and
-`SIGHUP` reloads. A list is downloaded immediately only when no cache exists.
+directory. Startup and `SIGHUP` load cached lists without making network requests.
+Missing lists are downloaded after DNS starts serving, with retry delays growing
+up to 30 seconds if the network is unavailable. Until a first download succeeds,
+local rules and any existing cached lists remain active.
 
 `filter_refresh_interval_secs` controls scheduled remote filter refreshes and
 defaults to `86400` (one day). Set it to `0` to disable scheduled refreshes.
@@ -149,6 +151,20 @@ These bootstrap queries use plaintext DNS only to discover the HTTPS server
 addresses; normal forwarded queries remain encrypted and verify each URL's TLS
 hostname. If `bootstrap_ips` is omitted, the system resolver performs the
 initial hostname lookups instead.
+
+Hostname-based DoH upstreams are initialized independently in the background.
+An unavailable bootstrap resolver does not prevent UDP/TCP listeners, local
+rewrites, LAN hostnames, or cached filtering rules from starting. Queries that
+need forwarding return `SERVFAIL` while no upstream is ready. Bootstrap lookups
+have a five-second deadline and retry with exponential backoff from one to
+30 seconds. An available upstream can serve queries while another is recovering.
+
+Once resolved, an upstream keeps its resolver and DNS cache across transient
+network failures. Its addresses are refreshed in the background; unchanged
+addresses or a failed refresh do not discard that resolver. Network recovery
+does not require a process restart. Configure `bootstrap_ips` when the system
+resolver forwards to Astra itself, to avoid a DNS bootstrap loop. These settings
+do not add a plaintext fallback for ordinary queries or disable TLS verification.
 
 A URL whose host is already an IP address can use the compact form directly,
 for example `https://1.1.1.1/dns-query`. DoH uses HTTP/2 with certificate
@@ -314,7 +330,8 @@ after a successful `SIGHUP` reload.
 
 Remote filter cache files are also re-read on `SIGHUP`, but they are not
 downloaded again until `filter_refresh_interval_secs` elapses. A newly enabled
-filter with no cache is downloaded during its first load.
+filter with no cache is downloaded in the background after the new local rules
+are loaded, including when scheduled refreshes are disabled.
 
 Changes to listener or process-level settings such as listen addresses, port,
 TCP or UDP enablement, timeout, user, or group still require a full restart.

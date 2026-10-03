@@ -128,7 +128,16 @@ enum RuleOrigin {
 
 impl CompiledRuleSets {
     pub async fn build(config: AdblockRuntimeConfig, _config_path: &Path) -> Result<Self, String> {
-        Self::build_with_fetch_mode(config, FilterFetchMode::CacheFirst).await
+        Self::build_with_fetch_mode(config, FilterFetchMode::CacheOnly).await
+    }
+
+    /// Whether enabled lists still need their initial background download.
+    pub fn has_uncached_filters(config: &AdblockRuntimeConfig) -> bool {
+        let options = FilterFetchOptions::new(config.filter_cache_dir.clone());
+        config
+            .filters
+            .iter()
+            .any(|filter| filter.enabled && !options.is_cached(filter))
     }
 
     pub async fn refresh(
