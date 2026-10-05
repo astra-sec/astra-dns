@@ -24,7 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
 
   build:
     name: Build ${{ matrix.target }}
@@ -71,7 +71,7 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: Build release binary
-        run: ${{ matrix.command }} build --release --target ${{ matrix.target }}
+        run: ${{ matrix.command }} build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact
         shell: bash
