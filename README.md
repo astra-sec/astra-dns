@@ -362,3 +362,14 @@ Query the server:
 dig @127.0.0.1 -p 8053 example.com A
 dig @127.0.0.1 -p 8053 example.com A +tcp
 ```
+
+## License
+
+`astra-dns` is licensed under the [MIT License](./LICENSE).
+
+Portions of this project are derived from [Hickory DNS](https://github.com/hickory-dns/hickory-dns)
+and retain their original copyright and dual MIT/Apache-2.0 license notices.
+The corresponding upstream license texts are included in
+[LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).
+These portions may be used under the MIT option when distributing `astra-dns`.
+Third-party dependencies remain covered by their respective licenses.

@@ -78,6 +78,7 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
+          cp LICENSE LICENSE-MIT LICENSE-APACHE dist/
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "astra-dns-${{ matrix.target }}.zip" ./dist/*
           else
